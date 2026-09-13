@@ -1,0 +1,21 @@
+{
+  "name": "priest-trade",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Priest.trade — Monad-native perpetuals launchpad and trading exchange",
+  "scripts": {
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "lint": "turbo run lint",
+    "contracts:build": "cd contracts && forge build",
+    "contracts:test": "cd contracts && forge test",
+    "contracts:install": "cd contracts && ./install-deps.sh"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3",
+    "turbo": "^2.1.2",
+    "typescript": "^5.5.4"
+  },
+  "packageManager": "pnpm@9.10.0"
+}

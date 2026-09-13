@@ -1,0 +1,37 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+solc_version = "0.8.28"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+remappings = [
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+  "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+  "forge-std/=lib/forge-std/src/",
+  "@uniswap/v4-core/=lib/v4-periphery/lib/v4-core/",
+  "@uniswap/v4-periphery/=lib/v4-periphery/",
+  "permit2/=lib/v4-periphery/lib/permit2/",
+  "solmate/=lib/v4-periphery/lib/v4-core/lib/solmate/",
+]
+code_size_limit = 131072
+fs_permissions = [
+  { access = "read-write", path = "./deployments" },
+  # Uniswap v4 artifacts (built in their own repos with their pinned solc) for tests and testnet deploys.
+  { access = "read", path = "./lib/v4-periphery/foundry-out" },
+  { access = "read", path = "./lib/v4-periphery/lib/v4-core/out" },
+]
+
+[profile.test]
+via_ir = true
+
+[rpc_endpoints]
+monad_testnet = "${MONAD_TESTNET_RPC_URL}"
+monad_mainnet = "${MONAD_MAINNET_RPC_URL}"
+
+[lint]
+lint_on_build = false
