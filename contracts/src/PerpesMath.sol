@@ -1,3 +1,4 @@
+/// @dev Continuous EWMA Funding & Virtual AMM Curves
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
