@@ -8,8 +8,18 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+
 import {PerpesMath} from "../../src/PerpesMath.sol";
+import {PerpesSecondaryMath} from "../../src/PerpesSecondaryMath.sol";
 import {PerpesToken} from "../../src/PerpesToken.sol";
+import {PerpesUniswap} from "../../src/PerpesUniswap.sol";
 
 /// @title PerpesEngine
 /// @notice EVM (Monad) port of the Perpes Solana program's primary engine: a
@@ -22,9 +32,20 @@ import {PerpesToken} from "../../src/PerpesToken.sol";
 /// `Market.vaultBalanceUsdc` — the equivalent of the per-market vault token
 /// account on Solana — so one market's traders can never be paid from another's.
 ///
-/// Not ported yet: graduation to the oracle-priced secondary engine, the CLOB
-/// and copy vaults. Markets therefore stay on the primary curve.
-contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeable, ReentrancyGuardUpgradeable {
+/// Graduation: a protocol-approved market moves to the secondary engine. The
+/// engine seeds a token/USDC Uniswap v4 pool at the market's price with
+/// full-range liquidity whose position NFT is minted to the burn address, burns
+/// the rest of the token supply, and from then on prices the perp off the
+/// pool's TWAP (pushed by an operator, sanity-checked against the live pool)
+/// plus a premium that grows with open-interest skew — the Solana program's
+/// secondary engine. Not ported: the CLOB and copy vaults.
+contract PerpesEngineV2 is
+    Initializable,
+    UUPSUpgradeable,
+    Ownable2StepUpgradeable,
+    ReentrancyGuardUpgradeable,
+    IUnlockCallback
+{
     using SafeERC20 for IERC20;
 
     // ── Types ──────────────────────────────────────────────────────────────────
@@ -207,6 +228,105 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         uint256 fundingDebt;
     }
 
+    /// Graduation thresholds and secondary-engine risk parameters (defaults
+    /// mirror programs/perpes/src/state/secondary.rs). Snapshotted onto a
+    /// market when its graduation is approved.
+    struct SecondaryConfig {
+        // Eligibility
+        uint64 minAgeSeconds;
+        uint32 minUniqueTraders;
+        uint16 maxVaultStressBps;
+        uint256 minVolumeUsdc;
+        uint256 minPeakOiUsdc;
+        // Oracle
+        uint64 transitionSeconds;
+        uint64 velocityWindowSeconds;
+        uint64 maxPriceStalenessSeconds;
+        uint64 maxLiquidityStalenessSeconds;
+        uint16 maxOracleSpotDeviationBps;
+        uint16 velocityCircuitBps;
+        // Risk
+        uint16 virtualLiqMultiplier;
+        uint16 maxOiMultiplier;
+        uint256 minVirtualLiquidityUsdc;
+        uint8 initialMaxLeverageX;
+        uint8 maxLeverageCapX;
+        uint8 leverageStepPer24h;
+        uint16 maxExecutionImpactBps;
+        uint16 maxMarkDeviationBps;
+        uint16 minSpreadBps;
+        uint16 maxPositionShareBps;
+        int64 fundingVelocityBps;
+        int64 fundingRateCapBps;
+        uint64 fundingIntervalSeconds;
+        // Uniswap v4 pool
+        uint24 poolFee;
+        int24 tickSpacing;
+    }
+
+    /// A market's graduation and secondary-engine state.
+    struct Secondary {
+        bool approved;
+        bool adminOverride;
+        bool active;
+        bool velocityTripped;
+        uint64 approvedAt;
+        uint64 graduatedAt;
+        uint64 lastOracleTs;
+        uint64 lastLiquidityTs;
+        uint64 velocityWindowTs;
+        // Price the pool was seeded at; blended out over the transition window.
+        uint256 syntheticSnapshotE6;
+        // Latest pool TWAP pushed by an operator.
+        uint256 spotTwapE6;
+        // The market's oracle: synthetic → spot blend.
+        uint256 oracleE6;
+        uint256 velocityWindowPriceE6;
+        uint256 spotLiquidityUsdc;
+        uint256 skewScaleUsdc;
+        uint256 maxOiUsdc;
+        uint256 seedUsdc;
+        uint256 seedTokens;
+        uint256 lpTokenId;
+        uint128 lpLiquidity;
+        bytes32 poolId;
+        SecondaryConfig cfg;
+    }
+
+    /// On-chain graduation metrics, tracked from the first trade.
+    struct MarketStats {
+        uint32 uniqueTraders;
+        uint256 peakOiUsdc;
+    }
+
+    struct Eligibility {
+        uint256 ageSeconds;
+        uint256 volumeUsdc;
+        uint32 uniqueTraders;
+        uint256 peakOiUsdc;
+        uint256 vaultStressBps;
+        bool allMet;
+    }
+
+    struct UniswapV4 {
+        address poolManager;
+        address positionManager;
+        address permit2;
+    }
+
+    /// What `graduate` put into the pool.
+    struct Seeded {
+        bytes32 poolId;
+        uint256 lpTokenId;
+        uint128 liquidity;
+        uint256 usdcInPool;
+        uint256 tokensInPool;
+    }
+
+    /// An existing pool may sit this far (bps) from the market price; further
+    /// and `graduate` swaps it into line first.
+    uint256 internal constant POOL_PRICE_TOLERANCE_BPS = 50;
+
     // ── Storage ────────────────────────────────────────────────────────────────
 
     IERC20 public usdc;
@@ -222,6 +342,15 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     /// collateral, TP/SL, liquidations and claims keep working. Appended after
     /// the v1 layout — new state goes below this line.
     bool public tradingPaused;
+    /// Graduation (appended in the v2 layout — new state goes below this line).
+    SecondaryConfig internal _secondaryConfig;
+    mapping(address token => Secondary) internal _secondary;
+    mapping(address token => MarketStats) internal _stats;
+    /// May push secondary oracle/liquidity and execute approved graduations.
+    mapping(address account => bool) public isOperator;
+    UniswapV4 public uniswap;
+    /// True only while `graduate` is swapping a pre-existing pool into line.
+    bool private transient _correctingPool;
 
     // ── Events ─────────────────────────────────────────────────────────────────
 
@@ -361,6 +490,33 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     );
     event CreatorFeesClaimed(address indexed market, address indexed creator, uint256 amountUsdc, uint256 timestamp);
     event ProtocolFeesClaimed(address indexed market, address indexed wallet, uint256 amountUsdc, uint256 timestamp);
+    event SecondaryConfigUpdated(address indexed authority, uint256 timestamp);
+    event UniswapSet(address poolManager, address positionManager, address permit2);
+    event OperatorSet(address indexed operator, bool enabled);
+    event GraduationApproved(address indexed market, address indexed approvedBy, bool adminOverride, uint256 timestamp);
+    event GraduationRevoked(address indexed market, uint256 timestamp);
+    event PoolPriceCorrected(address indexed market, uint160 fromSqrtPriceX96, uint160 toSqrtPriceX96);
+    event MarketGraduated(
+        address indexed market,
+        bytes32 indexed poolId,
+        uint256 lpTokenId,
+        uint128 liquidity,
+        uint256 usdcInPool,
+        uint256 tokensInPool,
+        uint256 priceE6,
+        uint256 timestamp
+    );
+    event SecondaryOracleUpdated(
+        address indexed market,
+        uint256 spotTwapE6,
+        uint256 liveSpotE6,
+        uint256 oracleE6,
+        bool velocityTripped,
+        uint256 timestamp
+    );
+    event SecondaryLiquidityUpdated(
+        address indexed market, uint256 spotLiquidityUsdc, uint256 skewScaleUsdc, uint256 maxOiUsdc, uint256 timestamp
+    );
 
     // ── Errors ─────────────────────────────────────────────────────────────────
 
@@ -398,6 +554,17 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     error InvalidOrder();
     error TradingPaused();
     error InsufficientVaultHeadroom();
+    error EligibilityNotMet();
+    error SecondaryNotActive();
+    error PriceDataStale();
+    error LiquidityDataStale();
+    error OpenInterestCapExceeded();
+    error PositionLimitExceeded();
+    error OracleDeviatesFromSpot();
+    error PoolPriceMismatch();
+    error ImmediateRoundtripProfit();
+    error InvalidPrice();
+    error UniswapNotConfigured();
 
     // ── Init / admin ───────────────────────────────────────────────────────────
 
@@ -433,6 +600,65 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         emit ConfigUpdated(msg.sender, block.timestamp);
     }
 
+    modifier onlyOperator() {
+        if (!isOperator[msg.sender] && msg.sender != owner()) revert Unauthorized();
+        _;
+    }
+
+    /// One-time setup for the graduation upgrade (run via upgradeToAndCall).
+    function initializeGraduation(SecondaryConfig calldata c, UniswapV4 calldata u, address operator)
+        external
+        reinitializer(2)
+        onlyOwner
+    {
+        _setSecondaryConfig(c);
+        _setUniswap(u);
+        if (operator != address(0)) _setOperator(operator, true);
+    }
+
+    function setSecondaryConfig(SecondaryConfig calldata c) external onlyOwner {
+        _setSecondaryConfig(c);
+    }
+
+    function setUniswap(UniswapV4 calldata u) external onlyOwner {
+        _setUniswap(u);
+    }
+
+    function setOperator(address operator, bool enabled) external onlyOwner {
+        _setOperator(operator, enabled);
+    }
+
+    function _setSecondaryConfig(SecondaryConfig calldata c) internal {
+        _validateSecondaryConfig(c);
+        _secondaryConfig = c;
+        emit SecondaryConfigUpdated(msg.sender, block.timestamp);
+    }
+
+    function _validateSecondaryConfig(SecondaryConfig calldata c) internal pure {
+        if (
+            c.initialMaxLeverageX == 0 || c.maxLeverageCapX < c.initialMaxLeverageX || c.maxLeverageCapX > 100
+                || c.fundingIntervalSeconds == 0 || uint256(c.maxExecutionImpactBps) + c.minSpreadBps >= 10_000
+                || c.maxMarkDeviationBps >= 10_000 || c.maxPositionShareBps == 0 || c.maxPositionShareBps > 10_000
+                || c.maxOiMultiplier == 0 || c.maxPriceStalenessSeconds == 0 || c.maxLiquidityStalenessSeconds == 0
+                || c.maxOracleSpotDeviationBps == 0 || c.maxOracleSpotDeviationBps >= 10_000 || c.velocityWindowSeconds == 0
+                || c.maxVaultStressBps > 10_000 || c.tickSpacing < TickMath.MIN_TICK_SPACING
+                || c.tickSpacing > TickMath.MAX_TICK_SPACING || c.poolFee > 1_000_000
+        ) revert InvalidConfig();
+    }
+
+    function _setUniswap(UniswapV4 calldata u) internal {
+        if (u.poolManager == address(0) || u.positionManager == address(0) || u.permit2 == address(0)) {
+            revert InvalidConfig();
+        }
+        uniswap = u;
+        emit UniswapSet(u.poolManager, u.positionManager, u.permit2);
+    }
+
+    function _setOperator(address operator, bool enabled) internal {
+        isOperator[operator] = enabled;
+        emit OperatorSet(operator, enabled);
+    }
+
     function setTradingPaused(bool paused) external onlyOwner {
         tradingPaused = paused;
         emit TradingPausedSet(paused, block.timestamp);
@@ -444,9 +670,12 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     }
 
     /// Delisted markets take no new risk; existing positions can still close.
+    /// A graduated market can't be delisted (its pricing depends on the status);
+    /// pause trading or stop the oracle instead.
     function delistMarket(address token) external onlyOwner {
         Market storage m = _markets[token];
         if (m.status == MarketStatus.None) revert MarketNotFound();
+        if (m.status == MarketStatus.Graduated) revert InvalidEngineTransition();
         m.status = MarketStatus.Delisted;
         emit MarketDelisted(token, block.timestamp);
     }
@@ -478,6 +707,7 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         m = _markets[token];
         if (m.status == MarketStatus.None) revert MarketNotFound();
         _accrue(m);
+        if (m.status == MarketStatus.Graduated) _refreshSecondary(m, _secondary[token]);
     }
 
     /// Margin ratio (bps of cost basis) the liquidation check would see now, and
@@ -495,6 +725,68 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         unrealizedPnlUsdc = PerpesMath.unrealizedPnl(p.side == Side.Long, p.sizeUsdc, p.baseAmount, m.markPriceE6);
         marginRatioBps = _marginRatioBps(p, m);
         liquidatable = marginRatioBps < int256(uint256(m.maintenanceMarginBps));
+    }
+
+    function secondaryConfig() external view returns (SecondaryConfig memory) {
+        return _secondaryConfig;
+    }
+
+    function getSecondary(address token) external view returns (Secondary memory) {
+        return _secondary[token];
+    }
+
+    function marketStats(address token) external view returns (MarketStats memory) {
+        return _stats[token];
+    }
+
+    /// The graduation criteria as measured on-chain right now.
+    function graduationEligibility(address token) public view returns (Eligibility memory e) {
+        Market memory m = previewMarket(token);
+        MarketStats memory st = _stats[token];
+        SecondaryConfig memory c = _secondaryConfig;
+        e.ageSeconds = block.timestamp - m.createdAt;
+        e.volumeUsdc = m.totalVolumeUsdc;
+        e.uniqueTraders = st.uniqueTraders;
+        e.peakOiUsdc = st.peakOiUsdc;
+        e.vaultStressBps = _vaultStressBps(m);
+        e.allMet = (m.status == MarketStatus.Warmup || m.status == MarketStatus.Active) && c.initialMaxLeverageX != 0
+            && e.ageSeconds >= c.minAgeSeconds && e.volumeUsdc >= c.minVolumeUsdc && e.uniqueTraders >= c.minUniqueTraders
+            && e.peakOiUsdc >= c.minPeakOiUsdc && e.vaultStressBps <= c.maxVaultStressBps;
+    }
+
+    /// The token/USDC v4 pool a market graduates (or graduated) into.
+    function graduationPoolKey(address token) public view returns (PoolKey memory) {
+        Secondary storage s = _secondary[token];
+        SecondaryConfig storage c = (s.approved || s.active) ? s.cfg : _secondaryConfig;
+        return PerpesUniswap.poolKey(token, address(usdc), c.poolFee, c.tickSpacing);
+    }
+
+    /// Live price of the market's v4 pool (0 if it doesn't exist yet).
+    function spotPriceE6(address token) public view returns (uint256) {
+        if (uniswap.poolManager == address(0)) revert UniswapNotConfigured();
+        return PerpesUniswap.spotPriceE6(IPoolManager(uniswap.poolManager), graduationPoolKey(token), token < address(usdc));
+    }
+
+    /// USDC side of the pool's in-range liquidity.
+    function poolUsdcDepth(address token) public view returns (uint256) {
+        if (uniswap.poolManager == address(0)) revert UniswapNotConfigured();
+        return PerpesUniswap.usdcDepth(IPoolManager(uniswap.poolManager), graduationPoolKey(token), token < address(usdc));
+    }
+
+    /// Fill price a graduated market would give a taker of `notional` now.
+    function quoteSecondary(address token, Side takerSide, uint256 notional) external view returns (uint256) {
+        Market memory m = previewMarket(token);
+        if (m.status != MarketStatus.Graduated) revert SecondaryNotActive();
+        Secondary storage s = _secondary[token];
+        return PerpesSecondaryMath.executionPriceE6(
+            m.indexPriceE6,
+            _skew(m),
+            takerSide == Side.Long,
+            notional,
+            s.skewScaleUsdc,
+            s.cfg.minSpreadBps,
+            s.cfg.maxExecutionImpactBps
+        );
     }
 
     /// Whether `executeTrigger` would fire now, and which leg.
@@ -612,20 +904,23 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         if (notionalUsdc == 0) revert InvalidCloseSize();
         Market memory m = _loadOpenableMarket(token);
         _accrue(m);
-        if (!_oiWithinCap(m, notionalUsdc)) revert PrimaryOpenInterestCapExceeded();
+        _prepSecondary(token, m, true);
+        _checkOpenCaps(token, m, notionalUsdc);
         if ((notionalUsdc * 100) / collateralUsdc > uint256(_currentMaxLeverage(m)) * 100) revert LeverageTooHigh();
 
         Position memory p = _positions[token][msg.sender];
         _resetTriggersIfFlat(p);
         _settle(p, m);
         if (p.pendingLiquidation) revert PendingLiquidation();
+        _checkPositionShare(token, m, p, notionalUsdc);
 
-        uint256 priceBefore = m.markPriceE6;
-        Fill memory fill = _primaryOpenFill(m, side, notionalUsdc);
+        uint256 priceBefore = _referencePrice(m);
+        Fill memory fill = _openFill(token, m, side, notionalUsdc);
         _checkSlippage(side, priceBefore, fill.priceE6, maxSlippageBps);
 
         uint256 fee = PerpesMath.notionalFee(notionalUsdc, m.takerFeeBps);
         _increase(p, m, side, fill, collateralUsdc);
+        _afterFill(token, m);
         if (_marginRatioBps(p, m) < int256(uint256(m.maintenanceMarginBps))) revert LeverageTooHigh();
         _accrueFee(m, token, msg.sender, fee);
         _refreshHealth(m);
@@ -643,8 +938,9 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     /// `closeNotionalUsdc` is cost basis; pass the full size to close everything.
     function closePosition(address token, uint256 closeNotionalUsdc, uint16 maxSlippageBps) external nonReentrant {
         if (closeNotionalUsdc == 0) revert InvalidCloseSize();
-        Market memory m = _loadPrimaryMarket(token);
+        Market memory m = _loadMarket(token);
         _accrue(m);
+        _prepSecondary(token, m, false);
         Position memory p = _positions[token][msg.sender];
         _settle(p, m);
         if (p.pendingLiquidation) revert PendingLiquidation();
@@ -681,6 +977,7 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         if (amountUsdc == 0) revert InsufficientCollateral();
         Market memory m = _loadMarket(token);
         _accrue(m);
+        _prepSecondary(token, m, false);
         Position memory p = _positions[token][msg.sender];
         _settle(p, m);
         if (p.pendingLiquidation) revert PendingLiquidation();
@@ -714,8 +1011,9 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     /// equity pays the liquidator, then an insurance penalty, then the owner;
     /// negative equity is covered by insurance, then recorded as bad debt.
     function liquidate(address token, address owner_) external nonReentrant {
-        Market memory m = _loadPrimaryMarket(token);
+        Market memory m = _loadMarket(token);
         _accrue(m);
+        _prepSecondary(token, m, false);
         Position memory p = _positions[token][owner_];
         if (p.sizeUsdc == 0) revert LiquidationNotAllowed();
         _settle(p, m);
@@ -729,8 +1027,9 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         {
             int256 equity = int256(p.collateralUsdc) - int256(_fundingDebt(p, m, closeSize));
             (uint256 base, uint256 released) = _reduceAmounts(p, closeSize);
-            Fill memory fill = _primaryCloseFill(m, side, base);
+            Fill memory fill = _liquidationFill(m, side, base);
             _applyReduce(p, m, closeSize, base, released);
+            _afterFill(token, m);
             p.pendingLiquidation = false;
             priceE6 = fill.priceE6;
             (reward, ownerPay) = _liquidationPayouts(
@@ -746,7 +1045,7 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
 
         emit PositionLiquidated(owner_, token, msg.sender, side, closeSize, priceE6, reward, block.timestamp);
         _emitMarket(token, m);
-        _emitPosition(token, owner_, _positions[token][owner_]);
+        _emitStoredPosition(token, owner_);
     }
 
     /// Splits a liquidated position's equity `gross` (collateral − carried funding
@@ -781,7 +1080,7 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     function claimUnsettledProfit(address token) external nonReentrant {
         Market memory m = _loadMarket(token);
         Position memory p = _positions[token][msg.sender];
-        uint256 amount = _min(p.unsettledProfitUsdc, _headroom(m));
+        uint256 amount = _min(p.unsettledProfitUsdc, _claimableHeadroom(m));
         if (amount == 0) revert NothingToClaim();
         p.unsettledProfitUsdc -= amount;
         m.unsettledProfitTotalUsdc = _subFloor(m.unsettledProfitTotalUsdc, amount);
@@ -796,6 +1095,7 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     function poke(address token) external {
         Market memory m = _loadMarket(token);
         _accrue(m);
+        if (m.status == MarketStatus.Graduated) _refreshSecondary(m, _secondary[token]);
         _markets[token] = m;
         _emitMarket(token, m);
     }
@@ -821,8 +1121,9 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     /// Closes the whole position at market once its TP or SL is hit. Anyone may
     /// call it (the keeper does); the payout always goes to the owner.
     function executeTrigger(address token, address owner_) external nonReentrant {
-        Market memory m = _loadPrimaryMarket(token);
+        Market memory m = _loadMarket(token);
         _accrue(m);
+        _prepSecondary(token, m, false);
         Position memory p = _positions[token][owner_];
         _settle(p, m);
         if (p.pendingLiquidation) revert PendingLiquidation();
@@ -845,7 +1146,7 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
             owner_, token, side, takeProfit, triggerPrice, fillPriceE6, closeSize, payout, block.timestamp
         );
         _emitMarket(token, m);
-        _emitPosition(token, owner_, _positions[token][owner_]);
+        _emitStoredPosition(token, owner_);
     }
 
     // ── Limit orders ───────────────────────────────────────────────────────────
@@ -866,8 +1167,13 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         if (collateralUsdc == 0) revert InsufficientCollateral();
         if (tradingPaused) revert TradingPaused();
         Market storage m = _markets[token];
-        if (m.status != MarketStatus.Warmup && m.status != MarketStatus.Active) revert InvalidMarketStatus();
-        if (leverage == 0 || leverage > m.flatMaxLeverageX) revert LeverageTooHigh();
+        bool graduated = m.status == MarketStatus.Graduated;
+        if (m.status != MarketStatus.Warmup && m.status != MarketStatus.Active && !graduated) {
+            revert InvalidMarketStatus();
+        }
+        // The fill re-checks against the live cap; this only rejects the impossible.
+        uint8 levCap = graduated ? _secondary[token].cfg.maxLeverageCapX : m.flatMaxLeverageX;
+        if (leverage == 0 || leverage > levCap) revert LeverageTooHigh();
         bool needsLimit = orderType == OrderType.Limit || orderType == OrderType.StopLimit
             || orderType == OrderType.ImmediateOrCancel || orderType == OrderType.FillOrKill;
         bool needsStop =
@@ -952,7 +1258,8 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         }
         if (fillNotionalUsdc == 0 || fillNotionalUsdc > o.remainingNotionalUsdc) revert InvalidCloseSize();
         _accrue(m);
-        if (!_oiWithinCap(m, fillNotionalUsdc)) revert PrimaryOpenInterestCapExceeded();
+        _prepSecondary(o.market, m, true);
+        _checkOpenCaps(o.market, m, fillNotionalUsdc);
 
         OrderFill memory f = _orderFillAmounts(o, m, fillNotionalUsdc);
         Position memory p = _positions[o.market][o.trader];
@@ -1006,7 +1313,8 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         _resetTriggersIfFlat(p);
         _settle(p, m);
         if (p.pendingLiquidation) revert PendingLiquidation();
-        Fill memory fill = _primaryOpenFill(m, o.side, f.notional);
+        _checkPositionShare(o.market, m, p, f.notional);
+        Fill memory fill = _openFill(o.market, m, o.side, f.notional);
         f.priceE6 = fill.priceE6;
         if (
             o.limitPriceE6 > 0
@@ -1018,6 +1326,7 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
             }
         }
         _increase(p, m, o.side, fill, f.effective);
+        _afterFill(o.market, m);
         if (_marginRatioBps(p, m) < int256(uint256(m.maintenanceMarginBps))) revert LeverageTooHigh();
         _accrueFee(m, o.market, o.trader, f.fee);
         _refreshHealth(m);
@@ -1073,6 +1382,266 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         emit ProtocolFeesClaimed(token, msg.sender, amount, block.timestamp);
     }
 
+    // ── Graduation ─────────────────────────────────────────────────────────────
+
+    /// Owner (the protocol) approves a market for graduation. Without
+    /// `adminOverride` every on-chain criterion must be met. Snapshots the
+    /// current secondary config onto the market.
+    function approveGraduation(address token, bool adminOverride) external onlyOwner {
+        Market memory m = previewMarket(token);
+        if (m.status != MarketStatus.Warmup && m.status != MarketStatus.Active) revert InvalidMarketStatus();
+        Secondary storage s = _secondary[token];
+        if (s.active) revert InvalidEngineTransition();
+        if (_secondaryConfig.initialMaxLeverageX == 0) revert InvalidConfig();
+        if (!adminOverride && !graduationEligibility(token).allMet) revert EligibilityNotMet();
+        s.approved = true;
+        s.adminOverride = adminOverride;
+        s.approvedAt = uint64(block.timestamp);
+        s.cfg = _secondaryConfig;
+        emit GraduationApproved(token, msg.sender, adminOverride, block.timestamp);
+    }
+
+    function revokeGraduation(address token) external onlyOwner {
+        Secondary storage s = _secondary[token];
+        if (!s.approved || s.active) revert InvalidEngineTransition();
+        s.approved = false;
+        emit GraduationRevoked(token, block.timestamp);
+    }
+
+    /// Executes an approved graduation: seeds the token/USDC v4 pool at the
+    /// market's index price with full-range liquidity minted to the burn
+    /// address, burns the rest of the supply and switches the market to the
+    /// secondary engine. `seedUsdc` is funded from the market's unclaimed
+    /// protocol fees first, then pulled from the caller. Reverts unless the
+    /// index sits within [minPriceE6, maxPriceE6] (protection against a
+    /// manipulated price at execution time).
+    function graduate(address token, uint256 seedUsdc, uint256 minPriceE6, uint256 maxPriceE6)
+        external
+        onlyOperator
+        nonReentrant
+    {
+        Secondary storage s = _secondary[token];
+        if (!s.approved || s.active) revert InvalidEngineTransition();
+        if (uniswap.positionManager == address(0)) revert UniswapNotConfigured();
+        if (seedUsdc == 0) revert InsufficientCollateral();
+        Market memory m = _loadMarket(token);
+        if (m.status != MarketStatus.Warmup && m.status != MarketStatus.Active) revert InvalidMarketStatus();
+        _accrue(m);
+        uint256 priceE6 = m.indexPriceE6;
+        if (priceE6 == 0 || priceE6 < minPriceE6 || priceE6 > maxPriceE6) revert SlippageExceeded();
+
+        uint256 fromFees = _min(seedUsdc, m.protocolFeesPendingUsdc);
+        m.protocolFeesPendingUsdc -= fromFees;
+        m.vaultBalanceUsdc -= fromFees;
+        if (seedUsdc > fromFees) usdc.safeTransferFrom(msg.sender, address(this), seedUsdc - fromFees);
+
+        uint256 usdcBefore = usdc.balanceOf(address(this));
+        Seeded memory r = _seedPool(token, s.cfg, priceE6, seedUsdc);
+        // USDC the pool didn't take (rounding), or that a price correction paid
+        // in, stays with this market as insurance.
+        uint256 leftover = seedUsdc + usdc.balanceOf(address(this)) - usdcBefore;
+        m.insuranceTrancheUsdc += leftover;
+        m.vaultBalanceUsdc += leftover;
+
+        // What's in the pool is all of this token that will ever trade.
+        uint256 rest = IERC20(token).balanceOf(address(this));
+        if (rest > 0) IERC20(token).safeTransfer(PerpesUniswap.DEAD, rest);
+
+        _activateSecondary(token, m, s, r, priceE6);
+    }
+
+    function _activateSecondary(address token, Market memory m, Secondary storage s, Seeded memory r, uint256 priceE6)
+        internal
+    {
+        SecondaryConfig storage c = s.cfg;
+        uint64 nowTs = uint64(block.timestamp);
+        m.status = MarketStatus.Graduated;
+        m.fundingVelocityBps = c.fundingVelocityBps;
+        m.fundingRateCapBps = c.fundingRateCapBps;
+        m.fundingIntervalSeconds = c.fundingIntervalSeconds;
+        // Liquidation threshold stays at the market's steady-state level; the
+        // secondary schedule only limits opening leverage (as on Solana).
+        m.maintenanceMarginBps = PerpesMath.maintenanceMarginBps(uint256(m.flatMaxLeverageX) * 100);
+        m.indexPriceE6 = priceE6;
+
+        s.active = true;
+        s.graduatedAt = nowTs;
+        s.syntheticSnapshotE6 = priceE6;
+        s.spotTwapE6 = priceE6;
+        s.oracleE6 = priceE6;
+        s.lastOracleTs = nowTs;
+        s.velocityWindowPriceE6 = priceE6;
+        s.velocityWindowTs = nowTs;
+        s.seedUsdc = r.usdcInPool;
+        s.seedTokens = r.tokensInPool;
+        s.lpTokenId = r.lpTokenId;
+        s.lpLiquidity = r.liquidity;
+        s.poolId = r.poolId;
+        _setSpotLiquidity(s, r.usdcInPool);
+        _refreshSecondary(m, s);
+        _markets[token] = m;
+
+        emit MarketGraduated(
+            token, r.poolId, r.lpTokenId, r.liquidity, r.usdcInPool, r.tokensInPool, priceE6, block.timestamp
+        );
+        _emitMarket(token, m);
+    }
+
+    /// Initializes the pool at `priceE6` (or swaps a pre-existing one into line)
+    /// and mints the full-range position, sized so the USDC side binds.
+    function _seedPool(address token, SecondaryConfig storage c, uint256 priceE6, uint256 seedUsdc)
+        internal
+        returns (Seeded memory r)
+    {
+        UniswapV4 memory u = uniswap;
+        IPoolManager pm = IPoolManager(u.poolManager);
+        PoolKey memory key = PerpesUniswap.poolKey(token, address(usdc), c.poolFee, c.tickSpacing);
+        bool tokenIs0 = token < address(usdc);
+        r.poolId = PerpesUniswap.poolId(key);
+
+        uint256 usdcStart = usdc.balanceOf(address(this));
+        uint160 target = PerpesUniswap.toSqrtPriceX96(priceE6, tokenIs0);
+        uint160 current = PerpesUniswap.sqrtPrice(pm, key);
+        if (current == 0) {
+            pm.initialize(key, target);
+        } else if (
+            PerpesSecondaryMath.velocityBps(PerpesUniswap.toPriceE6(current, tokenIs0), priceE6) > POOL_PRICE_TOLERANCE_BPS
+        ) {
+            _correctPoolPrice(token, pm, key, tokenIs0, current, target);
+        }
+        current = PerpesUniswap.sqrtPrice(pm, key);
+        uint256 poolPrice = PerpesUniswap.toPriceE6(current, tokenIs0);
+        if (PerpesSecondaryMath.velocityBps(poolPrice, priceE6) > POOL_PRICE_TOLERANCE_BPS) revert PoolPriceMismatch();
+
+        uint256 usdcForMint = seedUsdc + usdc.balanceOf(address(this)) - usdcStart;
+        uint256 tokenBalance = IERC20(token).balanceOf(address(this));
+        // 1% spare tokens so USDC is the binding side; the excess is burned.
+        uint256 tokens = _min(tokenBalance, (usdcForMint * PerpesUniswap.TOKEN_UNIT * 101) / (poolPrice * 100));
+        (uint256 a0, uint256 a1) = tokenIs0 ? (tokens, usdcForMint) : (usdcForMint, tokens);
+
+        uint256 usdcBeforeMint = usdc.balanceOf(address(this));
+        (r.lpTokenId, r.liquidity) =
+            PerpesUniswap.mintFullRangeToDead(u.positionManager, u.permit2, key, current, a0, a1);
+        r.usdcInPool = usdcBeforeMint - usdc.balanceOf(address(this));
+        r.tokensInPool = tokenBalance - IERC20(token).balanceOf(address(this));
+    }
+
+    /// Anyone can initialize a v4 pool, so the pool may already exist at a bad
+    /// price. Before graduation this engine holds the entire token supply, so
+    /// the only liquidity anyone else can have added is USDC bids below the
+    /// price: raising the price meets no resistance (1 wei of input moves it),
+    /// and lowering it sells our tokens into those bids above the target price.
+    function _correctPoolPrice(
+        address token,
+        IPoolManager pm,
+        PoolKey memory key,
+        bool tokenIs0,
+        uint160 current,
+        uint160 target
+    ) internal {
+        bool zeroForOne = target < current;
+        bool sellToken = zeroForOne == tokenIs0;
+        int256 amountIn = sellToken ? int256(IERC20(token).balanceOf(address(this)) / 2) : int256(1);
+        _correctingPool = true;
+        pm.unlock(abi.encode(key, SwapParams({zeroForOne: zeroForOne, amountSpecified: -amountIn, sqrtPriceLimitX96: target})));
+        _correctingPool = false;
+        emit PoolPriceCorrected(token, current, PerpesUniswap.sqrtPrice(pm, key));
+    }
+
+    /// v4 unlock callback — only for `_correctPoolPrice`'s swap.
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        if (msg.sender != uniswap.poolManager || !_correctingPool) revert Unauthorized();
+        (PoolKey memory key, SwapParams memory params) = abi.decode(data, (PoolKey, SwapParams));
+        IPoolManager pm = IPoolManager(msg.sender);
+        BalanceDelta delta = pm.swap(key, params, "");
+        _resolveDelta(pm, key.currency0, delta.amount0());
+        _resolveDelta(pm, key.currency1, delta.amount1());
+        return "";
+    }
+
+    function _resolveDelta(IPoolManager pm, Currency currency, int128 amount) internal {
+        if (amount < 0) {
+            pm.sync(currency);
+            IERC20(Currency.unwrap(currency)).safeTransfer(address(pm), uint256(uint128(-amount)));
+            pm.settle();
+        } else if (amount > 0) {
+            pm.take(currency, address(this), uint256(uint128(amount)));
+        }
+    }
+
+    // ── Secondary oracle ───────────────────────────────────────────────────────
+
+    /// Operator pushes the pool's TWAP, and optionally (non-zero) its USDC
+    /// depth — one transaction for both, since Monad charges every keeper call.
+    /// The TWAP must sit within the configured band of the live pool price,
+    /// which bounds what a bad push can do; the depth is capped at what the pool
+    /// holds on-chain. Recomputes the spot-velocity breaker and the
+    /// synthetic→spot blend, accrues funding at the old prices, then moves the
+    /// market's index (oracle) and mark.
+    function updateSecondaryOracle(address token, uint256 spotTwapE6, uint256 spotLiquidityUsdc)
+        external
+        onlyOperator
+    {
+        Secondary storage s = _secondary[token];
+        if (!s.active) revert SecondaryNotActive();
+        if (spotTwapE6 == 0) revert InvalidPrice();
+        if (spotLiquidityUsdc > 0) {
+            _setSpotLiquidity(s, _min(spotLiquidityUsdc, poolUsdcDepth(token)));
+            emit SecondaryLiquidityUpdated(token, s.spotLiquidityUsdc, s.skewScaleUsdc, s.maxOiUsdc, block.timestamp);
+        }
+        SecondaryConfig storage c = s.cfg;
+        uint256 live = spotPriceE6(token);
+        if (PerpesSecondaryMath.velocityBps(spotTwapE6, live) > c.maxOracleSpotDeviationBps) {
+            revert OracleDeviatesFromSpot();
+        }
+
+        uint256 nowTs = block.timestamp;
+        if (nowTs - s.velocityWindowTs >= c.velocityWindowSeconds) {
+            s.velocityWindowPriceE6 = s.spotTwapE6;
+            s.velocityWindowTs = uint64(nowTs);
+        }
+        s.velocityTripped = PerpesSecondaryMath.velocityBps(spotTwapE6, s.velocityWindowPriceE6) >= c.velocityCircuitBps;
+        s.spotTwapE6 = spotTwapE6;
+        s.lastOracleTs = uint64(nowTs);
+        uint256 progress = PerpesSecondaryMath.transitionProgressQ9(nowTs, s.graduatedAt, c.transitionSeconds);
+        s.oracleE6 = PerpesSecondaryMath.blendedPriceE6(s.syntheticSnapshotE6, spotTwapE6, progress);
+
+        Market memory m = _loadMarket(token);
+        _accrue(m);
+        m.indexPriceE6 = s.oracleE6;
+        _refreshSecondary(m, s);
+        _markets[token] = m;
+        emit SecondaryOracleUpdated(token, spotTwapE6, live, s.oracleE6, s.velocityTripped, nowTs);
+        _emitMarket(token, m);
+    }
+
+    /// Owner retunes an approved or graduated market's risk parameters (its
+    /// snapshot of the secondary config) — e.g. the staleness windows, which set
+    /// how often the operator must push. The pool shape can't change once chosen.
+    function setMarketSecondaryConfig(address token, SecondaryConfig calldata c) external onlyOwner {
+        Secondary storage s = _secondary[token];
+        if (!s.approved && !s.active) revert InvalidEngineTransition();
+        if (c.poolFee != s.cfg.poolFee || c.tickSpacing != s.cfg.tickSpacing) revert InvalidConfig();
+        _validateSecondaryConfig(c);
+        s.cfg = c;
+        if (s.active) _deriveFromLiquidity(s);
+        emit SecondaryConfigUpdated(msg.sender, block.timestamp);
+    }
+
+    function _setSpotLiquidity(Secondary storage s, uint256 spotLiquidityUsdc) internal {
+        s.spotLiquidityUsdc = spotLiquidityUsdc;
+        s.lastLiquidityTs = uint64(block.timestamp);
+        _deriveFromLiquidity(s);
+    }
+
+    /// Skew scale and OI cap follow the spot depth and the market's multipliers.
+    function _deriveFromLiquidity(Secondary storage s) internal {
+        SecondaryConfig storage c = s.cfg;
+        s.skewScaleUsdc =
+            PerpesSecondaryMath.skewScaleUsdc(s.spotLiquidityUsdc, c.virtualLiqMultiplier, c.minVirtualLiquidityUsdc);
+        s.maxOiUsdc = s.spotLiquidityUsdc * c.maxOiMultiplier;
+    }
+
     // ── Internals: loading / storing ───────────────────────────────────────────
 
     function _loadMarket(address token) internal view returns (Market memory m) {
@@ -1080,21 +1649,26 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
         if (m.status == MarketStatus.None) revert MarketNotFound();
     }
 
-    function _loadPrimaryMarket(address token) internal view returns (Market memory m) {
-        m = _loadMarket(token);
-        if (m.status == MarketStatus.Graduated) revert InvalidEngineTransition();
-    }
-
     function _loadOpenableMarket(address token) internal view returns (Market memory m) {
         if (tradingPaused) revert TradingPaused();
         m = _loadMarket(token);
-        if (m.status != MarketStatus.Warmup && m.status != MarketStatus.Active) revert InvalidMarketStatus();
+        if (m.status != MarketStatus.Warmup && m.status != MarketStatus.Active && m.status != MarketStatus.Graduated) {
+            revert InvalidMarketStatus();
+        }
     }
 
+    /// Also tracks the on-chain graduation metrics: a wallet's first trade in a
+    /// market counts it as a unique trader, and peak open interest is latched.
     function _store(address token, address owner_, Market memory m, Position memory p) internal {
+        _trackStats(_stats[token], p.tradeCount, m.oiLongUsdc + m.oiShortUsdc);
         p.tradeCount += 1;
         _markets[token] = m;
         _positions[token][owner_] = p;
+    }
+
+    function _trackStats(MarketStats storage st, uint64 priorTrades, uint256 oi) internal {
+        if (priorTrades == 0) st.uniqueTraders += 1;
+        if (oi > st.peakOiUsdc) st.peakOiUsdc = oi;
     }
 
     // ── Internals: accrual / health ────────────────────────────────────────────
@@ -1109,8 +1683,11 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
             m.fundingIndexE9 += (rate * int256(elapsed) * PerpesMath.ACCUMULATOR_SCALE) / 10_000
                 / int256(uint256(m.fundingIntervalSeconds));
             m.lastAccumulatorTs = uint64(nowTs);
-            m.indexPriceE6 =
-                PerpesMath.ewmaIndexE6(m.indexPriceE6, m.markPriceE6, elapsed, m.referenceUpdateIntervalSeconds);
+            // A graduated market's index is its oracle, set only by oracle pushes.
+            if (m.status != MarketStatus.Graduated) {
+                m.indexPriceE6 =
+                    PerpesMath.ewmaIndexE6(m.indexPriceE6, m.markPriceE6, elapsed, m.referenceUpdateIntervalSeconds);
+            }
             int256 premium = ((int256(m.markPriceE6) - int256(m.indexPriceE6)) * 10_000)
                 / int256(m.indexPriceE6 == 0 ? 1 : m.indexPriceE6);
             if (premium > PerpesMath.MAX_PREMIUM_BPS) premium = PerpesMath.MAX_PREMIUM_BPS;
@@ -1139,12 +1716,154 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     }
 
     function _currentMaxLeverage(Market memory m) internal view returns (uint8) {
+        if (m.status == MarketStatus.Graduated) return m.maxLeverageX;
         return block.timestamp < m.warmupUntil ? m.warmupMaxLeverageX : m.maxLeverageX;
     }
 
     function _oiWithinCap(Market memory m, uint256 incoming) internal pure returns (bool) {
         if (m.maxOiMultiple == 0) return true;
         return m.oiLongUsdc + m.oiShortUsdc + incoming <= m.liquidityDepthUsdc * m.maxOiMultiple;
+    }
+
+    // ── Internals: secondary engine ────────────────────────────────────────────
+
+    /// Graduated markets: rejects a stale oracle (and, for new risk, stale
+    /// liquidity data) and refreshes the leverage schedule and mark. No-op on
+    /// primary markets.
+    function _prepSecondary(address token, Market memory m, bool opening) internal view {
+        if (m.status != MarketStatus.Graduated) return;
+        Secondary storage s = _secondary[token];
+        uint256 nowTs = block.timestamp;
+        if (nowTs - s.lastOracleTs > s.cfg.maxPriceStalenessSeconds) revert PriceDataStale();
+        if (opening && nowTs - s.lastLiquidityTs > s.cfg.maxLiquidityStalenessSeconds) revert LiquidityDataStale();
+        _refreshSecondary(m, s);
+    }
+
+    /// Opening-leverage schedule (with the velocity breaker) and the skew mark.
+    function _refreshSecondary(Market memory m, Secondary storage s) internal view {
+        SecondaryConfig storage c = s.cfg;
+        m.maxLeverageX = uint8(
+            PerpesSecondaryMath.maxLeverageX(
+                s.graduatedAt,
+                block.timestamp,
+                c.initialMaxLeverageX,
+                c.leverageStepPer24h,
+                c.maxLeverageCapX,
+                s.velocityTripped
+            )
+        );
+        m.markPriceE6 =
+            PerpesSecondaryMath.markPriceE6(m.indexPriceE6, _skew(m), s.skewScaleUsdc, c.maxMarkDeviationBps);
+    }
+
+    function _secondaryMaxOi(Secondary storage s) internal view returns (uint256) {
+        return PerpesSecondaryMath.maxOiUsdc(s.spotLiquidityUsdc, s.cfg.maxOiMultiplier, s.velocityTripped);
+    }
+
+    function _checkOpenCaps(address token, Market memory m, uint256 incoming) internal view {
+        if (m.status != MarketStatus.Graduated) {
+            if (!_oiWithinCap(m, incoming)) revert PrimaryOpenInterestCapExceeded();
+            return;
+        }
+        if (m.oiLongUsdc + m.oiShortUsdc + incoming > _secondaryMaxOi(_secondary[token])) {
+            revert OpenInterestCapExceeded();
+        }
+    }
+
+    /// Graduated: one wallet may hold at most `maxPositionShareBps` of the OI cap.
+    function _checkPositionShare(address token, Market memory m, Position memory p, uint256 incoming)
+        internal
+        view
+    {
+        if (m.status != MarketStatus.Graduated) return;
+        Secondary storage s = _secondary[token];
+        if (p.sizeUsdc + incoming > (_secondaryMaxOi(s) * s.cfg.maxPositionShareBps) / 10_000) {
+            revert PositionLimitExceeded();
+        }
+    }
+
+    /// Price slippage is measured from: the curve price, or a graduated market's oracle.
+    function _referencePrice(Market memory m) internal pure returns (uint256) {
+        return m.status == MarketStatus.Graduated ? m.indexPriceE6 : m.markPriceE6;
+    }
+
+    function _openFill(address token, Market memory m, Side side, uint256 notional) internal view returns (Fill memory) {
+        if (m.status != MarketStatus.Graduated) return _primaryOpenFill(m, side, notional);
+        Secondary storage s = _secondary[token];
+        bool long = side == Side.Long;
+        uint256 price = PerpesSecondaryMath.executionPriceE6(
+            m.indexPriceE6, _skew(m), long, notional, s.skewScaleUsdc, s.cfg.minSpreadBps, s.cfg.maxExecutionImpactBps
+        );
+        uint256 base = PerpesSecondaryMath.baseForNotional(notional, price, !long);
+        if (base == 0) revert InvalidCloseSize();
+        return Fill(base, notional, price);
+    }
+
+    /// Closing `base` of a `side` position; on a graduated market the skew moves
+    /// by the closed cost basis (OI is tracked at cost basis).
+    function _closeFill(address token, Market memory m, Side side, uint256 base, uint256 closeNotional)
+        internal
+        view
+        returns (Fill memory)
+    {
+        if (m.status != MarketStatus.Graduated) return _primaryCloseFill(m, side, base);
+        Secondary storage s = _secondary[token];
+        uint256 price = PerpesSecondaryMath.executionPriceE6(
+            m.indexPriceE6,
+            _skew(m),
+            side == Side.Short,
+            closeNotional,
+            s.skewScaleUsdc,
+            s.cfg.minSpreadBps,
+            s.cfg.maxExecutionImpactBps
+        );
+        return _oracleCloseFill(side, base, price);
+    }
+
+    /// Graduated markets liquidate at the oracle itself — no premium or spread.
+    function _liquidationFill(Market memory m, Side side, uint256 base) internal pure returns (Fill memory) {
+        if (m.status == MarketStatus.Graduated) return _oracleCloseFill(side, base, m.indexPriceE6);
+        return _primaryCloseFill(m, side, base);
+    }
+
+    /// A close at `priceE6`; a short's buy-back rounds up.
+    function _oracleCloseFill(Side side, uint256 base, uint256 priceE6) internal pure returns (Fill memory) {
+        return Fill(base, PerpesMath.baseValue(base, priceE6, side == Side.Short), priceE6);
+    }
+
+    /// After a fill changes skew, a graduated market's mark follows it.
+    function _afterFill(address token, Market memory m) internal view {
+        if (m.status == MarketStatus.Graduated) _refreshSecondary(m, _secondary[token]);
+    }
+
+    function _skew(Market memory m) internal pure returns (int256) {
+        return int256(m.oiLongUsdc) - int256(m.oiShortUsdc);
+    }
+
+    /// Traders' net unrealized PnL at the mark (positive = owed by the vault).
+    function _aggregatePnl(Market memory m) internal pure returns (int256) {
+        return PerpesSecondaryMath.aggregateTraderPnl(m.baseLong, m.oiLongUsdc, m.baseShort, m.oiShortUsdc, m.markPriceE6);
+    }
+
+    /// Headroom deferred profit may be claimed from. On a graduated market the
+    /// vault backs open profit too, so a throttled closer can't claim that
+    /// share straight back.
+    function _claimableHeadroom(Market memory m) internal pure returns (uint256) {
+        uint256 available = _headroom(m);
+        if (m.status != MarketStatus.Graduated) return available;
+        int256 open = _aggregatePnl(m);
+        return open > 0 ? _subFloor(available, uint256(open)) : available;
+    }
+
+    /// Share of the vault's free balance already owed to traders — open profit,
+    /// deferred payouts and bad debt — in bps (capped at 100%).
+    function _vaultStressBps(Market memory m) internal pure returns (uint256) {
+        int256 open = _aggregatePnl(m);
+        uint256 owed = (open > 0 ? uint256(open) : 0) + m.unsettledProfitTotalUsdc + m.badDebtUsdc;
+        if (owed == 0) return 0;
+        uint256 headroom = _headroom(m);
+        uint256 bps = (owed * 10_000) / (headroom == 0 ? 1 : headroom);
+        return bps > 10_000 ? 10_000 : bps;
     }
 
     // ── Internals: positions ───────────────────────────────────────────────────
@@ -1324,9 +2043,15 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
             uint256 v = value > 0 ? uint256(value) : 0;
             uint256 principal = _min(v, c.released);
             uint256 deferred;
+            uint256 headroom = _headroom(m);
             // Primary: no profit throttle — on the curve traders' PnL nets to
-            // zero, so only the headroom cap applies.
-            (payNow, deferred) = PerpesMath.splitClosePayout(principal, v - principal, 10_000, _headroom(m));
+            // zero, so only the headroom cap applies. Graduated: the vault is
+            // the counterparty to net skew, so profit is throttled by how much
+            // of the vault open profit already claims.
+            uint256 claimRatio = m.status == MarketStatus.Graduated
+                ? PerpesSecondaryMath.claimRatioBps(PerpesSecondaryMath.utilizationBps(_aggregatePnl(m), headroom))
+                : 10_000;
+            (payNow, deferred) = PerpesMath.splitClosePayout(principal, v - principal, claimRatio, headroom);
             m.vaultBalanceUsdc -= payNow;
             if (deferred > 0) {
                 _deferPayout(c.token, c.owner, m, p, deferred);
@@ -1367,11 +2092,19 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     ) internal returns (uint256 payout, uint256 fillPriceE6) {
         Side side = p.side;
         uint256 debt = _fundingDebt(p, m, closeNotional);
+        uint64 lastTouch = p.lastUpdateTs;
         (uint256 base, uint256 released) = _reduceAmounts(p, closeNotional);
-        uint256 priceBefore = m.markPriceE6;
-        Fill memory fill = _primaryCloseFill(m, side, base);
+        uint256 priceBefore = _referencePrice(m);
+        Fill memory fill = _closeFill(token, m, side, base, closeNotional);
         _checkSlippage(_opposite(side), priceBefore, fill.priceE6, maxSlippageBps);
         _applyReduce(p, m, closeNotional, base, released);
+        // Graduated: a close in the same second as the position's last change
+        // must not be profitable, so premium/rounding can't be round-tripped.
+        if (
+            m.status == MarketStatus.Graduated && lastTouch == block.timestamp
+                && _signedPnl(side, closeNotional, fill.quote) > 0
+        ) revert ImmediateRoundtripProfit();
+        _afterFill(token, m);
         (payout,) = _settleClose(CloseSlice(token, owner_, side, closeNotional, released, debt), m, p, fill);
         fillPriceE6 = fill.priceE6;
     }
@@ -1476,13 +2209,21 @@ contract PerpesEngineV1 is Initializable, UUPSUpgradeable, Ownable2StepUpgradeab
     /// as its concatenated words), but this keeps 11 values off the stack of
     /// every caller.
     function _emitPosition(address token, address owner_, Position memory p) internal {
-        bytes memory data = bytes.concat(
-            abi.encode(p.side, p.sizeUsdc, p.baseAmount, p.collateralUsdc, p.entryPriceE6),
-            abi.encode(p.tpPriceE6, p.slPriceE6, p.pendingLiquidation, p.unsettledProfitUsdc)
-        );
+        bytes memory data = _positionStateData(p);
         bytes32 topic0 = PositionState.selector;
         assembly ("memory-safe") {
             log3(add(data, 0x20), mload(data), topic0, owner_, token)
         }
+    }
+
+    function _emitStoredPosition(address token, address owner_) internal {
+        _emitPosition(token, owner_, _positions[token][owner_]);
+    }
+
+    function _positionStateData(Position memory p) private pure returns (bytes memory) {
+        return bytes.concat(
+            abi.encode(p.side, p.sizeUsdc, p.baseAmount, p.collateralUsdc, p.entryPriceE6),
+            abi.encode(p.tpPriceE6, p.slPriceE6, p.pendingLiquidation, p.unsettledProfitUsdc)
+        );
     }
 }
