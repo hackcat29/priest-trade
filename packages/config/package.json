@@ -1,0 +1,13 @@
+{
+  "name": "@perpes/config",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "eslint-config-prettier": "^9.1.0"
+  },
+  "exports": {
+    "./eslint": "./eslint.config.js",
+    "./tsconfig": "./tsconfig.base.json",
+    "./tailwind": "./tailwind.config.ts"
+  }
+}
