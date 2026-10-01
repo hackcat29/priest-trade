@@ -1,0 +1,25 @@
+{
+  "name": "@perpes/evm-indexer",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "dev": "dotenv -e ../../.env -- tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@perpes/evm": "workspace:*",
+    "@perpes/offchain": "workspace:*",
+    "ioredis": "^5.4.1",
+    "pg": "^8.13.0",
+    "viem": "2.47.4"
+  },
+  "devDependencies": {
+    "@perpes/config": "workspace:*",
+    "@types/node": "^22.7.4",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.5.4"
+  }
+}
