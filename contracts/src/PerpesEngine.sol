@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
+// Snapshot of the v3 engine (68d5a99) as deployed on Monad testnet and mainnet — the upgrade tests start from it.
 pragma solidity ^0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
@@ -17,9 +19,16 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 import {PerpesMath} from "../../src/PerpesMath.sol";
+import {IUniswapV3FactoryLike, IUniswapV3PoolLike, PerpesOracle} from "../../src/PerpesOracle.sol";
 import {PerpesSecondaryMath} from "../../src/PerpesSecondaryMath.sol";
 import {PerpesToken} from "../../src/PerpesToken.sol";
 import {PerpesUniswap} from "../../src/PerpesUniswap.sol";
+
+/// The Counterflow vault, as the engine sees it.
+interface ICounterflowV1 {
+    function cover(address market, uint256 amount) external returns (uint256 paid);
+    function onIncome(address market, uint256 amount, uint256 repaid) external;
+}
 
 /// @title PerpesEngine
 /// @notice EVM (Monad) port of the Perpes Solana program's primary engine: a
@@ -39,7 +48,18 @@ import {PerpesUniswap} from "../../src/PerpesUniswap.sol";
 /// pool's TWAP (pushed by an operator, sanity-checked against the live pool)
 /// plus a premium that grows with open-interest skew — the Solana program's
 /// secondary engine. Not ported: the CLOB and copy vaults.
-contract PerpesEngineV2 is
+///
+/// Listing: anyone can open an oracle-priced market on an existing token that
+/// has a deep enough Uniswap v3 or v4 pool against USDC or MON.
+///
+/// Oracle: read on-chain from the market's pool — the v3 pool's own TWAP, or
+/// an engine-kept EMA of a v4 pool — with fills at the worse of oracle and
+/// live pool price, so neither a lagging oracle nor a moved pool can be farmed.
+///
+/// Counterflow: an LP vault (see CounterflowVault) backs selected oracle
+/// markets — it pays their winners in full when the market's own vault can't,
+/// and earns a share of their fees plus what their traders lose.
+contract PerpesEngineV3 is
     Initializable,
     UUPSUpgradeable,
     Ownable2StepUpgradeable,
@@ -162,6 +182,11 @@ contract PerpesEngineV2 is
         // Collateral locked in resting limit orders — held apart from the vault
         // so it can never back another trader's payout.
         uint256 orderEscrowUsdc;
+        // ── Counterflow (appended) ──
+        // Counterflow's fee share, reserved here until syncCounterflow sweeps it.
+        uint256 counterflowPendingUsdc;
+        // Covered by Counterflow and not yet repaid.
+        uint256 counterflowDrawnUsdc;
     }
 
     struct Position {
@@ -291,6 +316,80 @@ contract PerpesEngineV2 is
         uint128 lpLiquidity;
         bytes32 poolId;
         SecondaryConfig cfg;
+        // ── v3 layout (appended) ──
+        SourceKind sourceKind;
+        // Opened by listMarket on an existing token (not by graduation).
+        bool listed;
+        // Counterflow pays this market's winners in full and earns its surplus.
+        bool backed;
+        // The pool's other side: false = USDC, true = WMON (priced via the MON/USD pool).
+        bool quoteIsWmon;
+        // Token decimals (0 = 18, i.e. a Perpes launch).
+        uint8 baseDecimals;
+        // Listed v4 pool shape (graduation pools use cfg.poolFee / cfg.tickSpacing).
+        uint24 v4Fee;
+        int24 v4TickSpacing;
+        address v3Pool;
+        // Live pool price at the last read — fills use the worse of this and the oracle.
+        uint256 lastSpotE6;
+        // Delisted: exits only (an oracle market's status can't change).
+        bool closeOnly;
+    }
+
+    /// Where an oracle market's price comes from.
+    enum SourceKind {
+        // Uniswap v4 pool (engine-kept EMA)
+        V4,
+        // Uniswap v3 pool (the pool's own TWAP)
+        V3
+    }
+
+    /// On-chain oracle settings (v3 layout).
+    struct OracleConfig {
+        // Uniswap v3 factory listings must come from (0 = no v3 listings).
+        address v3Factory;
+        // WMON, and the v3 WMON/USDC pool MON-quoted markets are priced through.
+        address wmon;
+        address monUsdPool;
+        // v3 TWAP window.
+        uint32 twapWindowSeconds;
+        // v4 EMA: time constant, longest gap one sample may count for, and the
+        // band (around the EMA) a sample is clamped to.
+        uint32 emaTauSeconds;
+        uint32 maxSampleGapSeconds;
+        uint16 maxSampleDeviationBps;
+    }
+
+    /// Permissionless listing of existing tokens (v3 layout).
+    struct ListingConfig {
+        bool enabled;
+        uint8 maxLeverageX;
+        uint32 warmupSeconds;
+        uint256 listingFeeWei;
+        // Minimum USDC-equivalent depth of the pool's quote side.
+        uint256 minDepthUsdc;
+    }
+
+    /// Counterflow wiring (v3 layout).
+    struct CounterflowConfig {
+        address vault;
+        // Share of every fee on a backed market that goes to Counterflow
+        // (carved out of the protocol's cut).
+        uint16 feeShareBps;
+        // OI cap and skew scale multiplier (× pool depth) on a backed market.
+        uint16 backedOiMultiplier;
+        // Collateral share kept in a backed market before its surplus is swept.
+        uint16 surplusBufferBps;
+        // Newly graduated markets are backed automatically.
+        bool autoBackGraduated;
+    }
+
+    struct ListingParams {
+        SourceKind kind;
+        address v3Pool;
+        uint24 v4Fee;
+        int24 v4TickSpacing;
+        bool quoteIsWmon;
     }
 
     /// On-chain graduation metrics, tracked from the first trade.
@@ -351,6 +450,10 @@ contract PerpesEngineV2 is
     UniswapV4 public uniswap;
     /// True only while `graduate` is swapping a pre-existing pool into line.
     bool private transient _correctingPool;
+    /// Listing, on-chain oracle and Counterflow (appended in the v3 layout).
+    OracleConfig internal _oracleConfig;
+    ListingConfig internal _listingConfig;
+    CounterflowConfig internal _counterflowConfig;
 
     // ── Events ─────────────────────────────────────────────────────────────────
 
@@ -514,6 +617,26 @@ contract PerpesEngineV2 is
         bool velocityTripped,
         uint256 timestamp
     );
+    event MarketListed(
+        address indexed market,
+        address indexed lister,
+        SourceKind kind,
+        address v3Pool,
+        uint24 v4Fee,
+        int24 v4TickSpacing,
+        bool quoteIsWmon,
+        uint256 priceE6,
+        uint256 depthUsdc,
+        uint256 timestamp
+    );
+    event OracleConfigUpdated(address indexed authority, uint256 timestamp);
+    event ListingConfigUpdated(address indexed authority, uint256 timestamp);
+    event CounterflowConfigUpdated(address indexed vault, uint256 timestamp);
+    event CounterflowBackingSet(address indexed market, bool backed, uint256 timestamp);
+    event CounterflowDrawn(address indexed market, uint256 requested, uint256 paid, uint256 drawnTotal, uint256 timestamp);
+    event CounterflowSynced(
+        address indexed market, uint256 sentUsdc, uint256 repaidUsdc, uint256 feesUsdc, uint256 drawnTotal, uint256 timestamp
+    );
     event SecondaryLiquidityUpdated(
         address indexed market, uint256 spotLiquidityUsdc, uint256 skewScaleUsdc, uint256 maxOiUsdc, uint256 timestamp
     );
@@ -565,6 +688,12 @@ contract PerpesEngineV2 is
     error ImmediateRoundtripProfit();
     error InvalidPrice();
     error UniswapNotConfigured();
+    error ListingDisabled();
+    error AlreadyListed();
+    error InvalidListing();
+    error InsufficientPoolDepth();
+    error MarketWarmingUp();
+    error NotOracleMarket();
 
     // ── Init / admin ───────────────────────────────────────────────────────────
 
@@ -624,6 +753,69 @@ contract PerpesEngineV2 is
         _setUniswap(u);
     }
 
+    /// One-time setup for listing, the on-chain oracle and Counterflow (run
+    /// via upgradeToAndCall, or after initializeGraduation in the same batch).
+    function initializeV3(OracleConfig calldata o, ListingConfig calldata l, CounterflowConfig calldata c)
+        external
+        reinitializer(3)
+        onlyOwner
+    {
+        _setOracleConfig(o);
+        _setListingConfig(l);
+        _setCounterflowConfig(c);
+    }
+
+    function setOracleConfig(OracleConfig calldata o) external onlyOwner {
+        _setOracleConfig(o);
+    }
+
+    function setListingConfig(ListingConfig calldata l) external onlyOwner {
+        _setListingConfig(l);
+    }
+
+    function setCounterflowConfig(CounterflowConfig calldata c) external onlyOwner {
+        _setCounterflowConfig(c);
+    }
+
+    function _setOracleConfig(OracleConfig calldata o) internal {
+        if (
+            o.twapWindowSeconds == 0 || o.emaTauSeconds == 0 || o.maxSampleGapSeconds == 0
+                || o.maxSampleDeviationBps == 0 || o.maxSampleDeviationBps >= 10_000
+                || (o.wmon == address(0)) != (o.monUsdPool == address(0))
+        ) revert InvalidConfig();
+        _oracleConfig = o;
+        emit OracleConfigUpdated(msg.sender, block.timestamp);
+    }
+
+    function _setListingConfig(ListingConfig calldata l) internal {
+        if (l.maxLeverageX == 0 || l.maxLeverageX > 100 || l.minDepthUsdc == 0) revert InvalidConfig();
+        _listingConfig = l;
+        emit ListingConfigUpdated(msg.sender, block.timestamp);
+    }
+
+    function _setCounterflowConfig(CounterflowConfig calldata c) internal {
+        Config memory cfg = _config;
+        uint256 maxCreator = cfg.creatorFeeBps > cfg.creatorFeeBpsUnqualified ? cfg.creatorFeeBps : cfg.creatorFeeBpsUnqualified;
+        if (
+            maxCreator + cfg.insuranceFeeBpsStatic + c.feeShareBps > 10_000 || c.backedOiMultiplier == 0
+                || c.surplusBufferBps > 10_000
+        ) revert InvalidConfig();
+        _counterflowConfig = c;
+        emit CounterflowConfigUpdated(c.vault, block.timestamp);
+    }
+
+    /// Turns Counterflow backing on or off for an oracle market. An operator
+    /// may do it (no Safe round-trip per market); the vault's own per-market
+    /// and total exposure caps bound what any one market can draw.
+    function setCounterflowBacking(address token, bool backed) external onlyOperator {
+        Secondary storage s = _secondary[token];
+        if (!s.active) revert NotOracleMarket();
+        if (backed && _counterflowConfig.vault == address(0)) revert InvalidConfig();
+        s.backed = backed;
+        _deriveFromLiquidity(s);
+        emit CounterflowBackingSet(token, backed, block.timestamp);
+    }
+
     function setOperator(address operator, bool enabled) external onlyOwner {
         _setOperator(operator, enabled);
     }
@@ -670,12 +862,16 @@ contract PerpesEngineV2 is
     }
 
     /// Delisted markets take no new risk; existing positions can still close.
-    /// A graduated market can't be delisted (its pricing depends on the status);
-    /// pause trading or stop the oracle instead.
+    /// An oracle market (graduated or listed) keeps its status — its pricing
+    /// depends on it — and goes close-only instead.
     function delistMarket(address token) external onlyOwner {
         Market storage m = _markets[token];
         if (m.status == MarketStatus.None) revert MarketNotFound();
-        if (m.status == MarketStatus.Graduated) revert InvalidEngineTransition();
+        if (m.status == MarketStatus.Graduated) {
+            _secondary[token].closeOnly = true;
+            emit MarketDelisted(token, block.timestamp);
+            return;
+        }
         m.status = MarketStatus.Delisted;
         emit MarketDelisted(token, block.timestamp);
     }
@@ -727,6 +923,18 @@ contract PerpesEngineV2 is
         liquidatable = marginRatioBps < int256(uint256(m.maintenanceMarginBps));
     }
 
+    function oracleConfig() external view returns (OracleConfig memory) {
+        return _oracleConfig;
+    }
+
+    function listingConfig() external view returns (ListingConfig memory) {
+        return _listingConfig;
+    }
+
+    function counterflowConfig() external view returns (CounterflowConfig memory) {
+        return _counterflowConfig;
+    }
+
     function secondaryConfig() external view returns (SecondaryConfig memory) {
         return _secondaryConfig;
     }
@@ -761,16 +969,22 @@ contract PerpesEngineV2 is
         return PerpesUniswap.poolKey(token, address(usdc), c.poolFee, c.tickSpacing);
     }
 
-    /// Live price of the market's v4 pool (0 if it doesn't exist yet).
-    function spotPriceE6(address token) public view returns (uint256) {
-        if (uniswap.poolManager == address(0)) revert UniswapNotConfigured();
-        return PerpesUniswap.spotPriceE6(IPoolManager(uniswap.poolManager), graduationPoolKey(token), token < address(usdc));
+    /// Live price of the market's pool, USDC E6 (0 if it doesn't exist yet).
+    /// Before graduation this is the would-be graduation pool.
+    function spotPriceE6(address token) public view returns (uint256 spotE6) {
+        (spotE6,,) = _readSource(token, _secondary[token]);
     }
 
-    /// USDC side of the pool's in-range liquidity.
-    function poolUsdcDepth(address token) public view returns (uint256) {
-        if (uniswap.poolManager == address(0)) revert UniswapNotConfigured();
-        return PerpesUniswap.usdcDepth(IPoolManager(uniswap.poolManager), graduationPoolKey(token), token < address(usdc));
+    /// USDC value of the quote side of the pool's in-range liquidity.
+    function poolUsdcDepth(address token) public view returns (uint256 depthUsdc) {
+        (,, depthUsdc) = _readSource(token, _secondary[token]);
+    }
+
+    /// What `syncCounterflow` would send now: pending fee share, and surplus.
+    function counterflowSurplus(address token) public view returns (uint256 pendingFees, uint256 surplus) {
+        Market memory m = previewMarket(token);
+        pendingFees = m.counterflowPendingUsdc;
+        surplus = _surplus(m);
     }
 
     /// Fill price a graduated market would give a taker of `notional` now.
@@ -778,8 +992,9 @@ contract PerpesEngineV2 is
         Market memory m = previewMarket(token);
         if (m.status != MarketStatus.Graduated) revert SecondaryNotActive();
         Secondary storage s = _secondary[token];
+        (uint256 spot,,) = _readSource(token, s);
         return PerpesSecondaryMath.executionPriceE6(
-            m.indexPriceE6,
+            _worstOf(m.indexPriceE6, spot, takerSide == Side.Long),
             _skew(m),
             takerSide == Side.Long,
             notional,
@@ -986,9 +1201,7 @@ contract PerpesEngineV2 is
         uint256 newCollateral = p.collateralUsdc - amountUsdc;
         // Equity-based: collateral already lost to an unrealized loss isn't the
         // owner's to withdraw; unrealized profit doesn't count toward margin.
-        int256 pnl = PerpesMath.unrealizedPnl(
-            p.side == Side.Long, p.sizeUsdc, p.baseAmount, _marginPrice(m, p.side, false)
-        );
+        int256 pnl = PerpesMath.unrealizedPnl(p.side == Side.Long, p.sizeUsdc, p.baseAmount, _withdrawPrice(token, m, p.side));
         if (!PerpesMath.withdrawalKeepsInitialMargin(p.sizeUsdc, newCollateral, pnl, _currentMaxLeverage(m))) {
             revert WithdrawalBreachesMargin();
         }
@@ -1069,6 +1282,7 @@ contract PerpesEngineV2 is
         if (shortfall > 0) _coverShortfall(token, m, shortfall);
         _refreshHealth(m);
 
+        if (toLiquidator + toOwner > _headroom(m)) _drawCounterflow(token, m, toLiquidator + toOwner - _headroom(m));
         uint256 headroom = _headroom(m);
         reward = _min(toLiquidator, headroom);
         ownerPay = _min(toOwner, headroom - reward);
@@ -1080,6 +1294,8 @@ contract PerpesEngineV2 is
     function claimUnsettledProfit(address token) external nonReentrant {
         Market memory m = _loadMarket(token);
         Position memory p = _positions[token][msg.sender];
+        uint256 available = _claimableHeadroom(m);
+        if (p.unsettledProfitUsdc > available) _drawCounterflow(token, m, p.unsettledProfitUsdc - available);
         uint256 amount = _min(p.unsettledProfitUsdc, _claimableHeadroom(m));
         if (amount == 0) revert NothingToClaim();
         p.unsettledProfitUsdc -= amount;
@@ -1095,7 +1311,7 @@ contract PerpesEngineV2 is
     function poke(address token) external {
         Market memory m = _loadMarket(token);
         _accrue(m);
-        if (m.status == MarketStatus.Graduated) _refreshSecondary(m, _secondary[token]);
+        _prepSecondary(token, m, false);
         _markets[token] = m;
         _emitMarket(token, m);
     }
@@ -1472,6 +1688,8 @@ contract PerpesEngineV2 is
         s.lastOracleTs = nowTs;
         s.velocityWindowPriceE6 = priceE6;
         s.velocityWindowTs = nowTs;
+        s.lastSpotE6 = priceE6;
+        s.backed = _counterflowConfig.autoBackGraduated && _counterflowConfig.vault != address(0);
         s.seedUsdc = r.usdcInPool;
         s.seedTokens = r.tokensInPool;
         s.lpTokenId = r.lpTokenId;
@@ -1569,50 +1787,282 @@ contract PerpesEngineV2 is
         }
     }
 
-    // ── Secondary oracle ───────────────────────────────────────────────────────
+    // ── Listing ────────────────────────────────────────────────────────────────
 
-    /// Operator pushes the pool's TWAP, and optionally (non-zero) its USDC
-    /// depth — one transaction for both, since Monad charges every keeper call.
-    /// The TWAP must sit within the configured band of the live pool price,
-    /// which bounds what a bad push can do; the depth is capped at what the pool
-    /// holds on-chain. Recomputes the spot-velocity breaker and the
-    /// synthetic→spot blend, accrues funding at the old prices, then moves the
-    /// market's index (oracle) and mark.
-    function updateSecondaryOracle(address token, uint256 spotTwapE6, uint256 spotLiquidityUsdc)
-        external
-        onlyOperator
-    {
+    /// Permissionless: opens an oracle-priced market on an existing token that
+    /// has a Uniswap v3 (from the configured factory) or hookless v4 pool
+    /// against USDC or WMON, at least `minDepthUsdc` deep. The market trades on
+    /// the secondary engine; new positions wait out a short warmup while the
+    /// oracle settles. The lister earns the creator share of its fees. Listed
+    /// markets aren't Counterflow-backed unless an operator turns it on.
+    function listMarket(address token, ListingParams calldata p) external payable nonReentrant {
+        ListingConfig memory lc = _listingConfig;
+        if (!lc.enabled) revert ListingDisabled();
+        if (msg.value < lc.listingFeeWei) revert InvalidLaunchFee();
+        if (_markets[token].status != MarketStatus.None) revert AlreadyListed();
+        if (_secondaryConfig.initialMaxLeverageX == 0) revert InvalidConfig();
+        address quote = p.quoteIsWmon ? _oracleConfig.wmon : address(usdc);
+        if (quote == address(0) || token == quote || token == address(usdc) || token.code.length == 0) {
+            revert InvalidListing();
+        }
+        uint8 decimals = IERC20Metadata(token).decimals();
+        if (decimals == 0 || decimals > 30) revert InvalidListing();
+
         Secondary storage s = _secondary[token];
-        if (!s.active) revert SecondaryNotActive();
-        if (spotTwapE6 == 0) revert InvalidPrice();
-        if (spotLiquidityUsdc > 0) {
-            _setSpotLiquidity(s, _min(spotLiquidityUsdc, poolUsdcDepth(token)));
-            emit SecondaryLiquidityUpdated(token, s.spotLiquidityUsdc, s.skewScaleUsdc, s.maxOiUsdc, block.timestamp);
+        s.sourceKind = p.kind;
+        s.quoteIsWmon = p.quoteIsWmon;
+        s.baseDecimals = decimals;
+        s.listed = true;
+        if (p.kind == SourceKind.V3) {
+            address factory = _oracleConfig.v3Factory;
+            if (factory == address(0) || p.v3Pool == address(0)) revert InvalidListing();
+            uint24 fee = IUniswapV3PoolLike(p.v3Pool).fee();
+            if (IUniswapV3FactoryLike(factory).getPool(token, quote, fee) != p.v3Pool) revert InvalidListing();
+            s.v3Pool = p.v3Pool;
+        } else {
+            if (uniswap.poolManager == address(0)) revert UniswapNotConfigured();
+            s.v4Fee = p.v4Fee;
+            s.v4TickSpacing = p.v4TickSpacing;
         }
-        SecondaryConfig storage c = s.cfg;
-        uint256 live = spotPriceE6(token);
-        if (PerpesSecondaryMath.velocityBps(spotTwapE6, live) > c.maxOracleSpotDeviationBps) {
-            revert OracleDeviatesFromSpot();
-        }
+        (uint256 spot, uint256 twap, uint256 depth) = _readSource(token, s);
+        if (spot == 0 || depth < lc.minDepthUsdc) revert InsufficientPoolDepth();
+        // A v3 pool must already serve a TWAP over the window (enough history).
+        if (p.kind == SourceKind.V3 && twap == 0) revert InvalidListing();
+        _initListedMarket(token, s, p.kind == SourceKind.V3 ? twap : spot, spot, depth, lc);
 
-        uint256 nowTs = block.timestamp;
-        if (nowTs - s.velocityWindowTs >= c.velocityWindowSeconds) {
-            s.velocityWindowPriceE6 = s.spotTwapE6;
-            s.velocityWindowTs = uint64(nowTs);
-        }
-        s.velocityTripped = PerpesSecondaryMath.velocityBps(spotTwapE6, s.velocityWindowPriceE6) >= c.velocityCircuitBps;
-        s.spotTwapE6 = spotTwapE6;
-        s.lastOracleTs = uint64(nowTs);
-        uint256 progress = PerpesSecondaryMath.transitionProgressQ9(nowTs, s.graduatedAt, c.transitionSeconds);
-        s.oracleE6 = PerpesSecondaryMath.blendedPriceE6(s.syntheticSnapshotE6, spotTwapE6, progress);
+        emit MarketListed(
+            token, msg.sender, p.kind, p.v3Pool, p.v4Fee, p.v4TickSpacing, p.quoteIsWmon, s.oracleE6, depth, block.timestamp
+        );
+        if (lc.listingFeeWei > 0) _sendValue(_config.treasury, lc.listingFeeWei);
+        if (msg.value > lc.listingFeeWei) _sendValue(msg.sender, msg.value - lc.listingFeeWei);
+    }
 
-        Market memory m = _loadMarket(token);
-        _accrue(m);
-        m.indexPriceE6 = s.oracleE6;
+    function _initListedMarket(
+        address token,
+        Secondary storage s,
+        uint256 priceE6,
+        uint256 spotE6,
+        uint256 depth,
+        ListingConfig memory lc
+    ) internal {
+        Config memory c = _config;
+        SecondaryConfig memory sc = _secondaryConfig;
+        if (sc.initialMaxLeverageX > lc.maxLeverageX) sc.initialMaxLeverageX = lc.maxLeverageX;
+        if (sc.maxLeverageCapX > lc.maxLeverageX) sc.maxLeverageCapX = lc.maxLeverageX;
+        uint64 nowTs = uint64(block.timestamp);
+
+        Market memory m;
+        m.creator = msg.sender;
+        m.status = MarketStatus.Graduated;
+        m.flatMaxLeverageX = lc.maxLeverageX;
+        m.warmupMaxLeverageX = lc.maxLeverageX;
+        m.takerFeeBps = c.takerFeeBps;
+        m.creatorFeeBps = c.creatorFeeBps;
+        m.creatorFeeBpsUnqualified = c.creatorFeeBpsUnqualified;
+        m.insuranceFeeBpsStatic = c.insuranceFeeBpsStatic;
+        m.liquidationRewardBps = c.liquidationRewardBps;
+        m.liquidationPenaltyBps = c.liquidationPenaltyBps;
+        m.maxActiveOrdersPerWallet = c.maxActiveOrdersPerWallet;
+        m.fundingVelocityBps = sc.fundingVelocityBps;
+        m.fundingRateCapBps = sc.fundingRateCapBps;
+        m.fundingIntervalSeconds = sc.fundingIntervalSeconds;
+        m.referenceUpdateIntervalSeconds = c.referenceUpdateIntervalSeconds;
+        m.creatorFeeWindowSeconds = c.creatorFeeWindowSeconds;
+        m.createdAt = nowTs;
+        m.warmupUntil = nowTs + lc.warmupSeconds;
+        m.lastAccumulatorTs = nowTs;
+        m.creatorFeeVolumeThresholdUsdc = c.creatorFeeVolumeThresholdUsdc;
+        m.fundingOiFloorUsdc = c.fundingOiFloorUsdc;
+        m.tickSizeE6 = c.tickSizeE6;
+        m.maintenanceMarginBps = PerpesMath.maintenanceMarginBps(uint256(lc.maxLeverageX) * 100);
+        m.indexPriceE6 = priceE6;
+
+        s.active = true;
+        s.graduatedAt = nowTs;
+        s.cfg = sc;
+        s.syntheticSnapshotE6 = priceE6;
+        s.spotTwapE6 = priceE6;
+        s.oracleE6 = priceE6;
+        s.lastSpotE6 = spotE6;
+        s.lastOracleTs = nowTs;
+        s.spotLiquidityUsdc = depth;
+        s.lastLiquidityTs = nowTs;
+        _deriveFromLiquidity(s);
         _refreshSecondary(m, s);
         _markets[token] = m;
-        emit SecondaryOracleUpdated(token, spotTwapE6, live, s.oracleE6, s.velocityTripped, nowTs);
+        allMarkets.push(token);
+        emit MarketInitialized(token, msg.sender, block.timestamp);
         _emitMarket(token, m);
+    }
+
+    // ── On-chain oracle ────────────────────────────────────────────────────────
+
+    /// The market's pool: live price and its own TWAP (v3; 0 for v4), both
+    /// USDC E6, and the USDC value of the pool's quote side. Before a market
+    /// graduates this reads its would-be graduation pool.
+    function _readSource(address token, Secondary storage s)
+        internal
+        view
+        returns (uint256 spotE6, uint256 twapE6, uint256 depthUsdc)
+    {
+        OracleConfig storage oc = _oracleConfig;
+        bool wmonQuote = s.quoteIsWmon;
+        address quote = wmonQuote ? oc.wmon : address(usdc);
+        uint8 baseDec = s.baseDecimals == 0 ? 18 : s.baseDecimals;
+        uint8 quoteDec = wmonQuote ? 18 : 6;
+        bool baseIs0 = token < quote;
+        uint160 sqrtP;
+        uint128 liquidity;
+        if (s.sourceKind == SourceKind.V3) {
+            (sqrtP, liquidity) = PerpesOracle.v3Spot(s.v3Pool);
+            twapE6 = _v3TwapE18(s.v3Pool, baseIs0, baseDec, quoteDec);
+        } else {
+            if (uniswap.poolManager == address(0)) revert UniswapNotConfigured();
+            PoolKey memory key = s.listed
+                ? PerpesUniswap.poolKey(token, quote, s.v4Fee, s.v4TickSpacing)
+                : graduationPoolKey(token);
+            (sqrtP, liquidity) = PerpesOracle.v4Spot(IPoolManager(uniswap.poolManager), key);
+        }
+        if (sqrtP == 0) return (0, 0, 0);
+        spotE6 = PerpesOracle.priceE18(sqrtP, baseIs0, baseDec, quoteDec);
+        depthUsdc = PerpesOracle.quoteDepth(liquidity, sqrtP, !baseIs0);
+        // Concentrated v3 liquidity makes in-range "virtual" depth overstate
+        // what the pool holds; never count more than its actual quote balance.
+        if (s.sourceKind == SourceKind.V3) depthUsdc = _min(depthUsdc, IERC20(quote).balanceOf(s.v3Pool));
+        if (wmonQuote) {
+            // MON → USD from the reference pool's TWAP (its spot only if the
+            // pool can't serve the window).
+            bool wmonIs0 = oc.wmon < address(usdc);
+            uint256 monUsdE18 = _v3TwapE18(oc.monUsdPool, wmonIs0, 18, 6);
+            if (monUsdE18 == 0) {
+                (uint160 monSqrt,) = PerpesOracle.v3Spot(oc.monUsdPool);
+                monUsdE18 = PerpesOracle.priceE18(monSqrt, wmonIs0, 18, 6);
+            }
+            spotE6 = (spotE6 * monUsdE18) / 1e18;
+            twapE6 = (twapE6 * monUsdE18) / 1e18;
+            depthUsdc = (depthUsdc * monUsdE18) / 1e30;
+        }
+        spotE6 /= 1e12;
+        twapE6 /= 1e12;
+    }
+
+    /// A v3 pool's TWAP over the configured window (1e18 fixed), or 0 when the
+    /// pool doesn't keep enough observations to cover it.
+    function _v3TwapE18(address pool, bool baseIs0, uint8 baseDec, uint8 quoteDec) internal view returns (uint256) {
+        uint32 window = _oracleConfig.twapWindowSeconds;
+        uint32[] memory ago = new uint32[](2);
+        ago[0] = window;
+        try IUniswapV3PoolLike(pool).observe(ago) returns (int56[] memory cumulative, uint160[] memory) {
+            return PerpesOracle.priceE18(
+                PerpesOracle.meanTickSqrtPrice(cumulative[0], cumulative[1], window), baseIs0, baseDec, quoteDec
+            );
+        } catch {
+            return 0;
+        }
+    }
+
+    /// Reads the pool and updates the market's oracle: always the live price
+    /// (for worst-of fills and the breaker); at most once per second the
+    /// average — the v3 TWAP, or one clamped EMA step for v4 — and the depth,
+    /// whose increases are smoothed so JIT liquidity can't inflate caps.
+    function _sampleOracle(address token, Secondary storage s) internal {
+        (uint256 spot, uint256 twap, uint256 depth) = _readSource(token, s);
+        if (spot == 0) revert InvalidPrice();
+        s.lastSpotE6 = spot;
+        uint256 nowTs = block.timestamp;
+        uint256 dt = nowTs - s.lastOracleTs;
+        if (dt > 0) {
+            OracleConfig storage oc = _oracleConfig;
+            if (dt > oc.maxSampleGapSeconds) dt = oc.maxSampleGapSeconds;
+            // v3: the pool's own TWAP; v4 (or a v3 pool that can't serve the
+            // window right now): one clamped EMA step.
+            s.spotTwapE6 = (s.sourceKind == SourceKind.V3 && twap > 0)
+                ? twap
+                : PerpesOracle.emaStep(s.spotTwapE6, spot, dt, oc.emaTauSeconds, oc.maxSampleDeviationBps);
+            s.spotLiquidityUsdc = PerpesOracle.depthStep(s.spotLiquidityUsdc, depth, dt, oc.emaTauSeconds);
+            s.lastOracleTs = uint64(nowTs);
+            s.lastLiquidityTs = uint64(nowTs);
+            _deriveFromLiquidity(s);
+        }
+        SecondaryConfig storage c = s.cfg;
+        s.oracleE6 = s.listed
+            ? s.spotTwapE6
+            : PerpesSecondaryMath.blendedPriceE6(
+                s.syntheticSnapshotE6,
+                s.spotTwapE6,
+                PerpesSecondaryMath.transitionProgressQ9(nowTs, s.graduatedAt, c.transitionSeconds)
+            );
+        // Breaker: the pool running away from its own average (not from the
+        // blended oracle, which sits near the seed price during the transition).
+        s.velocityTripped = PerpesSecondaryMath.velocityBps(spot, s.spotTwapE6) >= c.velocityCircuitBps;
+        if (dt > 0) emit SecondaryOracleUpdated(token, s.spotTwapE6, spot, s.oracleE6, s.velocityTripped, nowTs);
+    }
+
+    /// The worse price for a taker: the higher of oracle and pool when buying,
+    /// the lower when selling.
+    function _worstOf(uint256 oracleE6, uint256 spotE6, bool takerIsBuy) internal pure returns (uint256) {
+        if (spotE6 == 0) return oracleE6;
+        if (takerIsBuy) return oracleE6 > spotE6 ? oracleE6 : spotE6;
+        return oracleE6 < spotE6 ? oracleE6 : spotE6;
+    }
+
+    // ── Counterflow ────────────────────────────────────────────────────────────
+
+    /// Sends a backed market's pending fee share and surplus (what its traders
+    /// have lost beyond what open positions could still claim) to Counterflow —
+    /// repaying earlier cover first. Permissionless; the keeper runs it.
+    function syncCounterflow(address token) external nonReentrant {
+        address vault = _counterflowConfig.vault;
+        if (vault == address(0)) revert InvalidConfig();
+        Market memory m = _loadMarket(token);
+        Secondary storage s = _secondary[token];
+        if (!s.backed && m.counterflowDrawnUsdc == 0 && m.counterflowPendingUsdc == 0) revert NotOracleMarket();
+        _accrue(m);
+        _prepSecondary(token, m, false);
+        uint256 fees = m.counterflowPendingUsdc;
+        // An unbacked market only repays what it drew; its surplus stays.
+        uint256 surplus = _surplus(m);
+        if (!s.backed && surplus > m.counterflowDrawnUsdc) surplus = m.counterflowDrawnUsdc;
+        uint256 send = fees + surplus;
+        if (send == 0) return;
+        uint256 repaid = _min(send, m.counterflowDrawnUsdc);
+        m.counterflowPendingUsdc = 0;
+        m.counterflowDrawnUsdc -= repaid;
+        m.vaultBalanceUsdc -= send;
+        _markets[token] = m;
+        usdc.safeTransfer(vault, send);
+        ICounterflowV1(vault).onIncome(token, send, repaid);
+        emit CounterflowSynced(token, send, repaid, fees, m.counterflowDrawnUsdc, block.timestamp);
+    }
+
+    /// Vault balance beyond everything the market could owe: reserved funds,
+    /// open collateral (plus a buffer for rounding and funding drift),
+    /// deferred payouts and open positions' net unrealized profit.
+    function _surplus(Market memory m) internal view returns (uint256) {
+        int256 open = _aggregatePnl(m);
+        uint256 owed = _reserved(m) + m.collateralPoolUsdc
+            + (m.collateralPoolUsdc * _counterflowConfig.surplusBufferBps) / 10_000 + m.unsettledProfitTotalUsdc
+            + (open > 0 ? uint256(open) : 0);
+        return _subFloor(m.vaultBalanceUsdc, owed);
+    }
+
+    /// Asks Counterflow to cover `amount` for a backed market; credits what it pays.
+    function _drawCounterflow(address token, Market memory m, uint256 amount) internal returns (uint256 paid) {
+        if (amount == 0 || !_secondary[token].backed) return 0;
+        address vault = _counterflowConfig.vault;
+        if (vault == address(0)) return 0;
+        // A vault failure must never block a close or a liquidation: no cover, the
+        // usual deferral applies. Only USDC that actually arrived is credited.
+        uint256 before = usdc.balanceOf(address(this));
+        try ICounterflowV1(vault).cover(token, amount) returns (uint256) {
+            paid = usdc.balanceOf(address(this)) - before;
+        } catch {
+            return 0;
+        }
+        if (paid == 0) return 0;
+        m.vaultBalanceUsdc += paid;
+        m.counterflowDrawnUsdc += paid;
+        emit CounterflowDrawn(token, amount, paid, m.counterflowDrawnUsdc, block.timestamp);
     }
 
     /// Owner retunes an approved or graduated market's risk parameters (its
@@ -1637,9 +2087,11 @@ contract PerpesEngineV2 is
     /// Skew scale and OI cap follow the spot depth and the market's multipliers.
     function _deriveFromLiquidity(Secondary storage s) internal {
         SecondaryConfig storage c = s.cfg;
-        s.skewScaleUsdc =
-            PerpesSecondaryMath.skewScaleUsdc(s.spotLiquidityUsdc, c.virtualLiqMultiplier, c.minVirtualLiquidityUsdc);
-        s.maxOiUsdc = s.spotLiquidityUsdc * c.maxOiMultiplier;
+        // Backing deepens the market: a larger skew scale (smaller premium) and OI cap.
+        uint256 skewMult = c.virtualLiqMultiplier;
+        if (s.backed && _counterflowConfig.backedOiMultiplier > skewMult) skewMult = _counterflowConfig.backedOiMultiplier;
+        s.skewScaleUsdc = PerpesSecondaryMath.skewScaleUsdc(s.spotLiquidityUsdc, skewMult, c.minVirtualLiquidityUsdc);
+        s.maxOiUsdc = s.spotLiquidityUsdc * _oiMultiplier(s);
     }
 
     // ── Internals: loading / storing ───────────────────────────────────────────
@@ -1727,15 +2179,18 @@ contract PerpesEngineV2 is
 
     // ── Internals: secondary engine ────────────────────────────────────────────
 
-    /// Graduated markets: rejects a stale oracle (and, for new risk, stale
-    /// liquidity data) and refreshes the leverage schedule and mark. No-op on
-    /// primary markets.
-    function _prepSecondary(address token, Market memory m, bool opening) internal view {
+    /// Oracle markets (graduated or listed): samples the pool, moves the index
+    /// to the oracle and refreshes the leverage schedule and mark. A listed
+    /// market takes no new risk until its warmup ends. No-op on primary markets.
+    function _prepSecondary(address token, Market memory m, bool opening) internal {
         if (m.status != MarketStatus.Graduated) return;
         Secondary storage s = _secondary[token];
-        uint256 nowTs = block.timestamp;
-        if (nowTs - s.lastOracleTs > s.cfg.maxPriceStalenessSeconds) revert PriceDataStale();
-        if (opening && nowTs - s.lastLiquidityTs > s.cfg.maxLiquidityStalenessSeconds) revert LiquidityDataStale();
+        if (opening) {
+            if (s.closeOnly) revert InvalidMarketStatus();
+            if (s.listed && block.timestamp < m.warmupUntil) revert MarketWarmingUp();
+        }
+        _sampleOracle(token, s);
+        m.indexPriceE6 = s.oracleE6;
         _refreshSecondary(m, s);
     }
 
@@ -1757,7 +2212,14 @@ contract PerpesEngineV2 is
     }
 
     function _secondaryMaxOi(Secondary storage s) internal view returns (uint256) {
-        return PerpesSecondaryMath.maxOiUsdc(s.spotLiquidityUsdc, s.cfg.maxOiMultiplier, s.velocityTripped);
+        return PerpesSecondaryMath.maxOiUsdc(s.spotLiquidityUsdc, _oiMultiplier(s), s.velocityTripped);
+    }
+
+    /// Counterflow-backed markets can carry more OI per dollar of pool depth.
+    function _oiMultiplier(Secondary storage s) internal view returns (uint256) {
+        uint256 base = s.cfg.maxOiMultiplier;
+        uint256 backed = _counterflowConfig.backedOiMultiplier;
+        return s.backed && backed > base ? backed : base;
     }
 
     function _checkOpenCaps(address token, Market memory m, uint256 incoming) internal view {
@@ -1792,7 +2254,13 @@ contract PerpesEngineV2 is
         Secondary storage s = _secondary[token];
         bool long = side == Side.Long;
         uint256 price = PerpesSecondaryMath.executionPriceE6(
-            m.indexPriceE6, _skew(m), long, notional, s.skewScaleUsdc, s.cfg.minSpreadBps, s.cfg.maxExecutionImpactBps
+            _worstOf(m.indexPriceE6, s.lastSpotE6, long),
+            _skew(m),
+            long,
+            notional,
+            s.skewScaleUsdc,
+            s.cfg.minSpreadBps,
+            s.cfg.maxExecutionImpactBps
         );
         uint256 base = PerpesSecondaryMath.baseForNotional(notional, price, !long);
         if (base == 0) revert InvalidCloseSize();
@@ -1809,7 +2277,7 @@ contract PerpesEngineV2 is
         if (m.status != MarketStatus.Graduated) return _primaryCloseFill(m, side, base);
         Secondary storage s = _secondary[token];
         uint256 price = PerpesSecondaryMath.executionPriceE6(
-            m.indexPriceE6,
+            _worstOf(m.indexPriceE6, s.lastSpotE6, side == Side.Short),
             _skew(m),
             side == Side.Short,
             closeNotional,
@@ -1909,6 +2377,14 @@ contract PerpesEngineV2 is
         if (!p.pendingLiquidation && p.sizeUsdc > 0 && _marginRatioBps(p, m) < int256(uint256(m.maintenanceMarginBps))) {
             p.pendingLiquidation = true;
         }
+    }
+
+    /// Withdrawals value a position at the least favourable of mark, index and
+    /// (on an oracle market) the live pool price.
+    function _withdrawPrice(address token, Market memory m, Side side) internal view returns (uint256) {
+        uint256 px = _marginPrice(m, side, false);
+        if (m.status != MarketStatus.Graduated) return px;
+        return _worstOf(px, _secondary[token].lastSpotE6, side == Side.Short);
     }
 
     /// Margin price: liquidation uses the price most favourable to the trader
@@ -2043,12 +2519,15 @@ contract PerpesEngineV2 is
             uint256 v = value > 0 ? uint256(value) : 0;
             uint256 principal = _min(v, c.released);
             uint256 deferred;
-            uint256 headroom = _headroom(m);
             // Primary: no profit throttle — on the curve traders' PnL nets to
-            // zero, so only the headroom cap applies. Graduated: the vault is
-            // the counterparty to net skew, so profit is throttled by how much
-            // of the vault open profit already claims.
-            uint256 claimRatio = m.status == MarketStatus.Graduated
+            // zero, so only the headroom cap applies. Oracle markets: the vault
+            // is the counterparty to net skew, so profit is throttled by how
+            // much of the vault open profit already claims — unless Counterflow
+            // backs the market, which then covers what the vault can't pay.
+            bool backed = _secondary[c.token].backed;
+            if (backed && v > _headroom(m)) _drawCounterflow(c.token, m, v - _headroom(m));
+            uint256 headroom = _headroom(m);
+            uint256 claimRatio = (m.status == MarketStatus.Graduated && !backed)
                 ? PerpesSecondaryMath.claimRatioBps(PerpesSecondaryMath.utilizationBps(_aggregatePnl(m), headroom))
                 : 10_000;
             (payNow, deferred) = PerpesMath.splitClosePayout(principal, v - principal, claimRatio, headroom);
@@ -2122,19 +2601,23 @@ contract PerpesEngineV2 is
         return side == Side.Long ? int256(exitQuote) - int256(costBasis) : int256(costBasis) - int256(exitQuote);
     }
 
-    /// Vault balance that isn't trader money: insurance plus unclaimed fees.
+    /// Vault balance that isn't trader money: insurance plus unclaimed fees
+    /// (Counterflow's share included).
     function _reserved(Market memory m) internal pure returns (uint256) {
-        return m.insuranceTrancheUsdc + m.creatorFeesPendingUsdc + m.protocolFeesPendingUsdc;
+        return m.insuranceTrancheUsdc + m.creatorFeesPendingUsdc + m.protocolFeesPendingUsdc + m.counterflowPendingUsdc;
     }
 
     function _headroom(Market memory m) internal pure returns (uint256) {
         return _subFloor(m.vaultBalanceUsdc, _reserved(m));
     }
 
+    /// A loss beyond a position's collateral: insurance first, then (backed
+    /// markets) Counterflow, and only the rest is bad debt.
     function _coverShortfall(address token, Market memory m, uint256 shortfall) internal {
         uint256 covered = _min(shortfall, m.insuranceTrancheUsdc);
         m.insuranceTrancheUsdc -= covered;
         uint256 uncovered = shortfall - covered;
+        uncovered -= _drawCounterflow(token, m, uncovered);
         m.badDebtUsdc += uncovered;
         emit BadDebtRecorded(token, shortfall, covered, uncovered, m.badDebtUsdc, block.timestamp);
     }
@@ -2157,11 +2640,14 @@ contract PerpesEngineV2 is
         uint256 creatorBps = m.creatorFeeTierUnlocked ? m.creatorFeeBps : m.creatorFeeBpsUnqualified;
         uint256 creatorCut = (fee * creatorBps) / 10_000;
         uint256 insuranceCut = (fee * m.insuranceFeeBpsStatic) / 10_000;
-        uint256 protocolCut = fee - creatorCut - insuranceCut;
+        // Backed markets: Counterflow's share comes out of the protocol's cut.
+        uint256 counterflowCut = _secondary[token].backed ? (fee * _counterflowConfig.feeShareBps) / 10_000 : 0;
+        uint256 protocolCut = fee - creatorCut - insuranceCut - counterflowCut;
         m.totalFeesCollectedUsdc += fee;
         m.creatorFeesPendingUsdc += creatorCut;
         m.insuranceTrancheUsdc += insuranceCut;
         m.protocolFeesPendingUsdc += protocolCut;
+        m.counterflowPendingUsdc += counterflowCut;
         emit TradingFeeAccrued(
             token, trader, fee, creatorCut, insuranceCut, protocolCut, m.creatorFeeTierUnlocked, block.timestamp
         );
