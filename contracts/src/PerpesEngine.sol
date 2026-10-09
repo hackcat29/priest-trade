@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Snapshot of the v3 engine (68d5a99) as deployed on Monad testnet and mainnet — the upgrade tests start from it.
 pragma solidity ^0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -9,6 +8,7 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
@@ -18,16 +18,18 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
-import {PerpesMath} from "../../src/PerpesMath.sol";
-import {IUniswapV3FactoryLike, IUniswapV3PoolLike, PerpesOracle} from "../../src/PerpesOracle.sol";
-import {PerpesSecondaryMath} from "../../src/PerpesSecondaryMath.sol";
-import {PerpesToken} from "../../src/PerpesToken.sol";
-import {PerpesUniswap} from "../../src/PerpesUniswap.sol";
+import {PerpesMath} from "./PerpesMath.sol";
+import {IUniswapV3FactoryLike, IUniswapV3PoolLike, PerpesOracle} from "./PerpesOracle.sol";
+import {PerpesSecondaryMath} from "./PerpesSecondaryMath.sol";
+import {PerpesToken} from "./PerpesToken.sol";
+import {PerpesUniswap} from "./PerpesUniswap.sol";
 
-/// The Counterflow vault, as the engine sees it.
-interface ICounterflowV1 {
-    function cover(address market, uint256 amount) external returns (uint256 paid);
-    function onIncome(address market, uint256 amount, uint256 repaid) external;
+/// A market's Counterflow vault, as the engine sees it.
+interface ICounterflow {
+    function initialize(address engine, address market, IERC20 usdc) external;
+    function cover(uint256 amount) external returns (uint256 paid);
+    function onIncome(uint256 amount, uint256 repaid) external;
+    function deposit(uint256 assets, address receiver) external returns (uint256 shares);
 }
 
 /// @title PerpesEngine
@@ -56,10 +58,24 @@ interface ICounterflowV1 {
 /// an engine-kept EMA of a v4 pool — with fills at the worse of oracle and
 /// live pool price, so neither a lagging oracle nor a moved pool can be farmed.
 ///
-/// Counterflow: an LP vault (see CounterflowVault) backs selected oracle
-/// markets — it pays their winners in full when the market's own vault can't,
-/// and earns a share of their fees plus what their traders lose.
-contract PerpesEngineV3 is
+/// Payouts: a closing winner always gets their collateral back; their profit is
+/// paid pro rata to a payout pool when every winner's open profit doesn't fit
+/// it, the rest forfeited (no IOU). On primary markets the pool is the market's
+/// free funds plus the losers' unwind loss (the curve is zero-sum, so this only
+/// bites when losses run past collateral); on oracle markets it's free funds
+/// plus a capped share of the market's Counterflow vault.
+///
+/// Counterflow: every oracle market gets its own LP vault (see CounterflowVault,
+/// a beacon proxy per market). Anyone may deposit and become that market's
+/// counterparty. On oracle markets winners get their collateral back in full
+/// and their profit pro rata to a pool — the market's free funds plus a capped
+/// share of its vault (`lpProfitBudgetBps` of its capital) — with the rest
+/// forfeited, so no market can drain its vault. The vault deepens its market
+/// (OI cap and skew scale grow with its cash) and owns its equity: 70% of every
+/// fee, liquidation penalties, forfeited profit and what traders lose.
+/// Oracle-market fees split 70% LPs / 20% creator / 10% protocol, with no
+/// insurance cut; a creator may route any part of their 20% into the vault.
+contract PerpesEngine is
     Initializable,
     UUPSUpgradeable,
     Ownable2StepUpgradeable,
@@ -183,10 +199,14 @@ contract PerpesEngineV3 is
         // so it can never back another trader's payout.
         uint256 orderEscrowUsdc;
         // ── Counterflow (appended) ──
-        // Counterflow's fee share, reserved here until syncCounterflow sweeps it.
-        uint256 counterflowPendingUsdc;
-        // Covered by Counterflow and not yet repaid.
+        // The creator's fees they chose to put into the market's vault, reserved
+        // here until syncCounterflow deposits them (v3: the shared vault's fee share).
+        uint256 creatorLpPendingUsdc;
+        // Covered by the market's vault and not yet repaid.
         uint256 counterflowDrawnUsdc;
+        // ── v4 (appended) ──
+        // Share of the creator's fee cut (bps) routed into the market's vault.
+        uint16 creatorLpBps;
     }
 
     struct Position {
@@ -251,6 +271,8 @@ contract PerpesEngineV3 is
         uint256 released;
         // Carried (unpaid) funding owed by the closed slice; comes out of its proceeds.
         uint256 fundingDebt;
+        // Oracle markets: every winner's open profit at the mark before the fill.
+        uint256 winnersBefore;
     }
 
     /// Graduation thresholds and secondary-engine risk parameters (defaults
@@ -320,7 +342,7 @@ contract PerpesEngineV3 is
         SourceKind sourceKind;
         // Opened by listMarket on an existing token (not by graduation).
         bool listed;
-        // Counterflow pays this market's winners in full and earns its surplus.
+        // The market's vault holds cash, so it's deeper and its winners are paid from it.
         bool backed;
         // The pool's other side: false = USDC, true = WMON (priced via the MON/USD pool).
         bool quoteIsWmon;
@@ -334,6 +356,9 @@ contract PerpesEngineV3 is
         uint256 lastSpotE6;
         // Delisted: exits only (an oracle market's status can't change).
         bool closeOnly;
+        // ── v4 (appended) ──
+        // OI cap and skew scale the market's vault adds on top of pool depth.
+        uint256 lpDepthUsdc;
     }
 
     /// Where an oracle market's price comes from.
@@ -370,18 +395,25 @@ contract PerpesEngineV3 is
         uint256 minDepthUsdc;
     }
 
-    /// Counterflow wiring (v3 layout).
-    struct CounterflowConfig {
-        address vault;
-        // Share of every fee on a backed market that goes to Counterflow
-        // (carved out of the protocol's cut).
-        uint16 feeShareBps;
-        // OI cap and skew scale multiplier (× pool depth) on a backed market.
-        uint16 backedOiMultiplier;
-        // Collateral share kept in a backed market before its surplus is swept.
+    /// Per-market Counterflow vaults and the oracle-market fee split (v4 layout).
+    struct LpConfig {
+        // UpgradeableBeacon every market's CounterflowVault proxy points at.
+        address vaultBeacon;
+        // Oracle-market fee split; sums to 10_000. No insurance cut.
+        uint16 lpFeeBps;
+        uint16 creatorFeeBps;
+        uint16 protocolFeeBps;
+        // A backed market's OI cap / skew scale may reach this × pool depth…
+        uint16 backedDepthMultiplier;
+        // …growing by this × the vault's cash.
+        uint16 lpOiMultiplier;
+        // Collateral share kept in a market before its equity is swept to the vault.
         uint16 surplusBufferBps;
-        // Newly graduated markets are backed automatically.
-        bool autoBackGraduated;
+        uint64 redeemCooldownSeconds;
+        bool depositsPaused;
+        // Share of the vault's cash that may go to winners' profit at any moment
+        // (the rest of their profit is paid pro rata, never owed).
+        uint16 lpProfitBudgetBps;
     }
 
     struct ListingParams {
@@ -453,7 +485,11 @@ contract PerpesEngineV3 is
     /// Listing, on-chain oracle and Counterflow (appended in the v3 layout).
     OracleConfig internal _oracleConfig;
     ListingConfig internal _listingConfig;
-    CounterflowConfig internal _counterflowConfig;
+    /// v3's shared-vault config (one slot), retired in v4 — kept for the layout.
+    uint256 private __retiredCounterflowConfig;
+    /// Per-market Counterflow vaults (appended in the v4 layout).
+    LpConfig internal _lpConfig;
+    mapping(address token => address) public lpVault;
 
     // ── Events ─────────────────────────────────────────────────────────────────
 
@@ -631,11 +667,18 @@ contract PerpesEngineV3 is
     );
     event OracleConfigUpdated(address indexed authority, uint256 timestamp);
     event ListingConfigUpdated(address indexed authority, uint256 timestamp);
-    event CounterflowConfigUpdated(address indexed vault, uint256 timestamp);
-    event CounterflowBackingSet(address indexed market, bool backed, uint256 timestamp);
+    event LpConfigUpdated(address indexed vaultBeacon, uint256 timestamp);
+    event LpVaultCreated(address indexed market, address vault, uint256 timestamp);
+    /// First deposit: the market's equity so far goes to `owner` (the protocol) as shares.
+    event LpActivated(address indexed market, address owner, uint256 equityUsdc, uint256 timestamp);
+    /// The LP share of a fee (kept in the market as its vault's equity) and the
+    /// part of the creator's share set aside for their vault deposit.
+    event LpFeeAccrued(address indexed market, uint256 lpCutUsdc, uint256 creatorStakeUsdc, uint256 timestamp);
+    event CreatorLpShareSet(address indexed market, uint16 bps, uint256 timestamp);
+    event CreatorLpStaked(address indexed market, address indexed creator, uint256 amountUsdc, uint256 shares, uint256 timestamp);
     event CounterflowDrawn(address indexed market, uint256 requested, uint256 paid, uint256 drawnTotal, uint256 timestamp);
     event CounterflowSynced(
-        address indexed market, uint256 sentUsdc, uint256 repaidUsdc, uint256 feesUsdc, uint256 drawnTotal, uint256 timestamp
+        address indexed market, uint256 sentUsdc, uint256 repaidUsdc, uint256 creatorStakeUsdc, uint256 drawnTotal, uint256 timestamp
     );
     event SecondaryLiquidityUpdated(
         address indexed market, uint256 spotLiquidityUsdc, uint256 skewScaleUsdc, uint256 maxOiUsdc, uint256 timestamp
@@ -694,6 +737,8 @@ contract PerpesEngineV3 is
     error InsufficientPoolDepth();
     error MarketWarmingUp();
     error NotOracleMarket();
+    error LpVaultExists();
+    error MarketUnderwater();
 
     // ── Init / admin ───────────────────────────────────────────────────────────
 
@@ -753,16 +798,35 @@ contract PerpesEngineV3 is
         _setUniswap(u);
     }
 
-    /// One-time setup for listing, the on-chain oracle and Counterflow (run
-    /// via upgradeToAndCall, or after initializeGraduation in the same batch).
-    function initializeV3(OracleConfig calldata o, ListingConfig calldata l, CounterflowConfig calldata c)
-        external
-        reinitializer(3)
-        onlyOwner
-    {
+    /// One-time setup for listing and the on-chain oracle (run after
+    /// initializeGraduation on a fresh deployment).
+    function initializeV3(OracleConfig calldata o, ListingConfig calldata l) external reinitializer(3) onlyOwner {
         _setOracleConfig(o);
         _setListingConfig(l);
-        _setCounterflowConfig(c);
+    }
+
+    /// One-time switch to per-market Counterflow vaults (upgradeToAndCall on a
+    /// live v3 engine, or after initializeV3 on a fresh one). The shared v3 vault
+    /// is retired: what markets drew from it is written off, its unswept fee
+    /// share goes back to the protocol, and every oracle market gets its vault
+    /// (and its insurance fund becomes its equity).
+    function initializeV4(LpConfig calldata c) external reinitializer(4) onlyOwner {
+        _setLpConfig(c);
+        uint256 n = allMarkets.length;
+        for (uint256 i; i < n; i++) {
+            address token = allMarkets[i];
+            Market storage m = _markets[token];
+            m.protocolFeesPendingUsdc += m.creatorLpPendingUsdc;
+            m.creatorLpPendingUsdc = 0;
+            m.counterflowDrawnUsdc = 0;
+            Secondary storage s = _secondary[token];
+            if (s.active) {
+                // Oracle markets carry no insurance: what they hold becomes equity.
+                m.insuranceTrancheUsdc = 0;
+                _createLpVault(token);
+                _deriveFromLiquidity(token, s);
+            }
+        }
     }
 
     function setOracleConfig(OracleConfig calldata o) external onlyOwner {
@@ -773,8 +837,8 @@ contract PerpesEngineV3 is
         _setListingConfig(l);
     }
 
-    function setCounterflowConfig(CounterflowConfig calldata c) external onlyOwner {
-        _setCounterflowConfig(c);
+    function setLpConfig(LpConfig calldata c) external onlyOwner {
+        _setLpConfig(c);
     }
 
     function _setOracleConfig(OracleConfig calldata o) internal {
@@ -793,27 +857,13 @@ contract PerpesEngineV3 is
         emit ListingConfigUpdated(msg.sender, block.timestamp);
     }
 
-    function _setCounterflowConfig(CounterflowConfig calldata c) internal {
-        Config memory cfg = _config;
-        uint256 maxCreator = cfg.creatorFeeBps > cfg.creatorFeeBpsUnqualified ? cfg.creatorFeeBps : cfg.creatorFeeBpsUnqualified;
+    function _setLpConfig(LpConfig calldata c) internal {
         if (
-            maxCreator + cfg.insuranceFeeBpsStatic + c.feeShareBps > 10_000 || c.backedOiMultiplier == 0
-                || c.surplusBufferBps > 10_000
+            uint256(c.lpFeeBps) + c.creatorFeeBps + c.protocolFeeBps != 10_000 || c.backedDepthMultiplier == 0
+                || c.surplusBufferBps > 10_000 || c.redeemCooldownSeconds > 30 days || c.lpProfitBudgetBps > 10_000
         ) revert InvalidConfig();
-        _counterflowConfig = c;
-        emit CounterflowConfigUpdated(c.vault, block.timestamp);
-    }
-
-    /// Turns Counterflow backing on or off for an oracle market. An operator
-    /// may do it (no Safe round-trip per market); the vault's own per-market
-    /// and total exposure caps bound what any one market can draw.
-    function setCounterflowBacking(address token, bool backed) external onlyOperator {
-        Secondary storage s = _secondary[token];
-        if (!s.active) revert NotOracleMarket();
-        if (backed && _counterflowConfig.vault == address(0)) revert InvalidConfig();
-        s.backed = backed;
-        _deriveFromLiquidity(s);
-        emit CounterflowBackingSet(token, backed, block.timestamp);
+        _lpConfig = c;
+        emit LpConfigUpdated(c.vaultBeacon, block.timestamp);
     }
 
     function setOperator(address operator, bool enabled) external onlyOwner {
@@ -931,8 +981,8 @@ contract PerpesEngineV3 is
         return _listingConfig;
     }
 
-    function counterflowConfig() external view returns (CounterflowConfig memory) {
-        return _counterflowConfig;
+    function lpConfig() external view returns (LpConfig memory) {
+        return _lpConfig;
     }
 
     function secondaryConfig() external view returns (SecondaryConfig memory) {
@@ -980,11 +1030,33 @@ contract PerpesEngineV3 is
         (,, depthUsdc) = _readSource(token, _secondary[token]);
     }
 
-    /// What `syncCounterflow` would send now: pending fee share, and surplus.
-    function counterflowSurplus(address token) public view returns (uint256 pendingFees, uint256 surplus) {
+    /// What `syncCounterflow` would move now: the creator's fees waiting to be
+    /// deposited, and the equity it would sweep (none until the vault has LPs).
+    function counterflowSurplus(address token) public view returns (uint256 creatorStake, uint256 surplus) {
         Market memory m = previewMarket(token);
-        pendingFees = m.counterflowPendingUsdc;
-        surplus = _surplus(m);
+        creatorStake = m.creatorLpPendingUsdc;
+        address vault = lpVault[token];
+        if (vault != address(0) && IERC20(vault).totalSupply() > 0) surplus = _surplus(m);
+    }
+
+    /// The market's equity (see `_marketEquity`) at the mark and at the live
+    /// pool price, were its vault to hold `vaultCash` — the vault prices
+    /// deposits by how its own cash changes what winners can claim.
+    function lpClaim(address token, uint256 vaultCash) external view returns (int256 atMark, int256 atSpot) {
+        Market memory m = previewMarket(token);
+        if (m.status != MarketStatus.Graduated) return (0, 0);
+        (uint256 spot,,) = _readSource(token, _secondary[token]);
+        atMark = _marketEquity(m, m.markPriceE6, vaultCash);
+        atSpot = _marketEquity(m, spot == 0 ? m.markPriceE6 : spot, vaultCash);
+    }
+
+    function lpDepositsOpen(address token) public view returns (bool) {
+        return !_lpConfig.depositsPaused && lpVault[token] != address(0)
+            && _markets[token].status == MarketStatus.Graduated && !_secondary[token].closeOnly;
+    }
+
+    function lpRedeemCooldown() external view returns (uint64) {
+        return _lpConfig.redeemCooldownSeconds;
     }
 
     /// Fill price a graduated market would give a taker of `notional` now.
@@ -1278,7 +1350,9 @@ contract PerpesEngineV3 is
             gross - int256(fee), exitQuote, m.liquidationRewardBps, m.liquidationPenaltyBps
         );
         _accrueFee(m, token, owner_, fee);
-        m.insuranceTrancheUsdc += toInsurance;
+        // Oracle markets have no insurance cut: the penalty stays in the market
+        // as its Counterflow vault's equity.
+        if (m.status != MarketStatus.Graduated) m.insuranceTrancheUsdc += toInsurance;
         if (shortfall > 0) _coverShortfall(token, m, shortfall);
         _refreshHealth(m);
 
@@ -1579,12 +1653,26 @@ contract PerpesEngineV3 is
     function claimCreatorFees(address token) external nonReentrant {
         Market storage m = _markets[token];
         if (msg.sender != m.creator) revert Unauthorized();
-        uint256 amount = m.creatorFeesPendingUsdc;
+        // Fees set aside for the creator's vault deposit are still theirs: a
+        // claim takes them as cash too (e.g. while the vault takes no deposits).
+        uint256 amount = m.creatorFeesPendingUsdc + m.creatorLpPendingUsdc;
         if (amount == 0) revert NothingToClaim();
         m.creatorFeesPendingUsdc = 0;
+        m.creatorLpPendingUsdc = 0;
         m.vaultBalanceUsdc -= amount;
         usdc.safeTransfer(msg.sender, amount);
         emit CreatorFeesClaimed(token, msg.sender, amount, block.timestamp);
+    }
+
+    /// The creator routes `bps` of their oracle-market fee share into the
+    /// market's Counterflow vault, as shares in their name (deposited when the
+    /// keeper syncs the market). 0 turns it off; may be set before graduation.
+    function setCreatorLpShare(address token, uint16 bps) external {
+        Market storage m = _markets[token];
+        if (msg.sender != m.creator) revert Unauthorized();
+        if (bps > 10_000) revert InvalidConfig();
+        m.creatorLpBps = bps;
+        emit CreatorLpShareSet(token, bps, block.timestamp);
     }
 
     function claimProtocolFees(address token) external nonReentrant {
@@ -1654,10 +1742,12 @@ contract PerpesEngineV3 is
         uint256 usdcBefore = usdc.balanceOf(address(this));
         Seeded memory r = _seedPool(token, s.cfg, priceE6, seedUsdc);
         // USDC the pool didn't take (rounding), or that a price correction paid
-        // in, stays with this market as insurance.
-        uint256 leftover = seedUsdc + usdc.balanceOf(address(this)) - usdcBefore;
-        m.insuranceTrancheUsdc += leftover;
-        m.vaultBalanceUsdc += leftover;
+        // in, stays with this market.
+        m.vaultBalanceUsdc += seedUsdc + usdc.balanceOf(address(this)) - usdcBefore;
+        // Oracle markets carry no insurance: the fund built up on the curve
+        // becomes the market's equity — the first cushion for its winners, and
+        // its Counterflow vault's (or, before any LP, the protocol's).
+        m.insuranceTrancheUsdc = 0;
 
         // What's in the pool is all of this token that will ever trade.
         uint256 rest = IERC20(token).balanceOf(address(this));
@@ -1689,13 +1779,12 @@ contract PerpesEngineV3 is
         s.velocityWindowPriceE6 = priceE6;
         s.velocityWindowTs = nowTs;
         s.lastSpotE6 = priceE6;
-        s.backed = _counterflowConfig.autoBackGraduated && _counterflowConfig.vault != address(0);
         s.seedUsdc = r.usdcInPool;
         s.seedTokens = r.tokensInPool;
         s.lpTokenId = r.lpTokenId;
         s.lpLiquidity = r.liquidity;
         s.poolId = r.poolId;
-        _setSpotLiquidity(s, r.usdcInPool);
+        _setSpotLiquidity(token, s, r.usdcInPool);
         _refreshSecondary(m, s);
         _markets[token] = m;
 
@@ -1703,6 +1792,7 @@ contract PerpesEngineV3 is
             token, r.poolId, r.lpTokenId, r.liquidity, r.usdcInPool, r.tokensInPool, priceE6, block.timestamp
         );
         _emitMarket(token, m);
+        _createLpVault(token);
     }
 
     /// Initializes the pool at `priceE6` (or swaps a pre-existing one into line)
@@ -1793,8 +1883,8 @@ contract PerpesEngineV3 is
     /// has a Uniswap v3 (from the configured factory) or hookless v4 pool
     /// against USDC or WMON, at least `minDepthUsdc` deep. The market trades on
     /// the secondary engine; new positions wait out a short warmup while the
-    /// oracle settles. The lister earns the creator share of its fees. Listed
-    /// markets aren't Counterflow-backed unless an operator turns it on.
+    /// oracle settles. The lister earns the creator share of its fees. It gets
+    /// its own Counterflow vault, which anyone may back.
     function listMarket(address token, ListingParams calldata p) external payable nonReentrant {
         ListingConfig memory lc = _listingConfig;
         if (!lc.enabled) revert ListingDisabled();
@@ -1833,6 +1923,7 @@ contract PerpesEngineV3 is
         emit MarketListed(
             token, msg.sender, p.kind, p.v3Pool, p.v4Fee, p.v4TickSpacing, p.quoteIsWmon, s.oracleE6, depth, block.timestamp
         );
+        _createLpVault(token);
         if (lc.listingFeeWei > 0) _sendValue(_config.treasury, lc.listingFeeWei);
         if (msg.value > lc.listingFeeWei) _sendValue(msg.sender, msg.value - lc.listingFeeWei);
     }
@@ -1887,7 +1978,7 @@ contract PerpesEngineV3 is
         s.lastOracleTs = nowTs;
         s.spotLiquidityUsdc = depth;
         s.lastLiquidityTs = nowTs;
-        _deriveFromLiquidity(s);
+        _deriveFromLiquidity(token, s);
         _refreshSecondary(m, s);
         _markets[token] = m;
         allMarkets.push(token);
@@ -1982,7 +2073,7 @@ contract PerpesEngineV3 is
             s.spotLiquidityUsdc = PerpesOracle.depthStep(s.spotLiquidityUsdc, depth, dt, oc.emaTauSeconds);
             s.lastOracleTs = uint64(nowTs);
             s.lastLiquidityTs = uint64(nowTs);
-            _deriveFromLiquidity(s);
+            _deriveFromLiquidity(token, s);
         }
         SecondaryConfig storage c = s.cfg;
         s.oracleE6 = s.listed
@@ -2008,53 +2099,201 @@ contract PerpesEngineV3 is
 
     // ── Counterflow ────────────────────────────────────────────────────────────
 
-    /// Sends a backed market's pending fee share and surplus (what its traders
-    /// have lost beyond what open positions could still claim) to Counterflow —
-    /// repaying earlier cover first. Permissionless; the keeper runs it.
+    /// Opens a Counterflow vault for an oracle market that doesn't have one yet
+    /// (graduations and listings get one automatically). Permissionless.
+    function createLpVault(address token) external returns (address vault) {
+        if (_markets[token].status != MarketStatus.Graduated) revert NotOracleMarket();
+        if (lpVault[token] != address(0)) revert LpVaultExists();
+        if (_lpConfig.vaultBeacon == address(0)) revert InvalidConfig();
+        return _createLpVault(token);
+    }
+
+    /// No-op until a vault beacon is configured, or when the market has a vault.
+    function _createLpVault(address token) internal returns (address vault) {
+        address beacon = _lpConfig.vaultBeacon;
+        if (beacon == address(0) || lpVault[token] != address(0)) return lpVault[token];
+        vault = address(new BeaconProxy(beacon, abi.encodeCall(ICounterflow.initialize, (address(this), token, usdc))));
+        lpVault[token] = vault;
+        emit LpVaultCreated(token, vault, block.timestamp);
+    }
+
+    /// The market's vault takes its first deposit: from here on the market's
+    /// equity is the vault's. What it built up before — LP fees and trader
+    /// losses while nobody backed it — goes to the protocol as shares, so the
+    /// first depositor can't take it. With an empty vault, winners can only
+    /// claim the market's own funds, so equity is ≥ 0 unless legacy deferred
+    /// payouts exceed them.
+    function lpActivate(address token) external returns (uint256 equityUsdc, address owner_) {
+        if (msg.sender != lpVault[token]) revert Unauthorized();
+        Market memory m = previewMarket(token);
+        (uint256 spot,,) = _readSource(token, _secondary[token]);
+        uint256 cash = _lpCash(token);
+        int256 atMark = _marketEquity(m, m.markPriceE6, cash);
+        int256 atSpot = _marketEquity(m, spot == 0 ? m.markPriceE6 : spot, cash);
+        int256 low = atMark < atSpot ? atMark : atSpot;
+        if (low < 0) revert MarketUnderwater();
+        equityUsdc = uint256(low);
+        owner_ = _config.protocolFeeWallet;
+        emit LpActivated(token, owner_, equityUsdc, block.timestamp);
+    }
+
+    /// Moves the market's sweepable equity — what its traders have lost beyond
+    /// what open positions could still claim, plus the LP fee share — to its
+    /// vault, repaying earlier cover first; and deposits the creator's set-aside
+    /// fees into the vault in their name. Permissionless; the keeper runs it.
+    /// Nothing is swept before the vault has its first deposit.
     function syncCounterflow(address token) external nonReentrant {
-        address vault = _counterflowConfig.vault;
-        if (vault == address(0)) revert InvalidConfig();
+        address vault = lpVault[token];
+        if (vault == address(0)) revert NotOracleMarket();
         Market memory m = _loadMarket(token);
-        Secondary storage s = _secondary[token];
-        if (!s.backed && m.counterflowDrawnUsdc == 0 && m.counterflowPendingUsdc == 0) revert NotOracleMarket();
         _accrue(m);
         _prepSecondary(token, m, false);
-        uint256 fees = m.counterflowPendingUsdc;
-        // An unbacked market only repays what it drew; its surplus stays.
-        uint256 surplus = _surplus(m);
-        if (!s.backed && surplus > m.counterflowDrawnUsdc) surplus = m.counterflowDrawnUsdc;
-        uint256 send = fees + surplus;
-        if (send == 0) return;
-        uint256 repaid = _min(send, m.counterflowDrawnUsdc);
-        m.counterflowPendingUsdc = 0;
-        m.counterflowDrawnUsdc -= repaid;
-        m.vaultBalanceUsdc -= send;
+        uint256 send;
+        uint256 repaid;
+        if (IERC20(vault).totalSupply() > 0) {
+            send = _surplus(m);
+            repaid = _min(send, m.counterflowDrawnUsdc);
+            m.counterflowDrawnUsdc -= repaid;
+            m.vaultBalanceUsdc -= send;
+        }
+        uint256 stake = lpDepositsOpen(token) ? m.creatorLpPendingUsdc : 0;
+        if (stake > 0) {
+            m.creatorLpPendingUsdc = 0;
+            m.vaultBalanceUsdc -= stake;
+        }
         _markets[token] = m;
-        usdc.safeTransfer(vault, send);
-        ICounterflowV1(vault).onIncome(token, send, repaid);
-        emit CounterflowSynced(token, send, repaid, fees, m.counterflowDrawnUsdc, block.timestamp);
+        if (send > 0) {
+            usdc.safeTransfer(vault, send);
+            ICounterflow(vault).onIncome(send, repaid);
+        }
+        // Last: a first deposit calls back into lpActivate, which reads stored state.
+        if (stake > 0) _stakeForCreator(token, vault, m.creator, stake);
+        if (send > 0 || stake > 0) {
+            emit CounterflowSynced(token, send, repaid, stake, m.counterflowDrawnUsdc, block.timestamp);
+        }
+    }
+
+    /// Deposits `amount` of the creator's fees into the vault in their name. If
+    /// the vault refuses it (e.g. underwater), the fees stay set aside.
+    function _stakeForCreator(address token, address vault, address creator_, uint256 amount) internal {
+        usdc.forceApprove(vault, amount);
+        try ICounterflow(vault).deposit(amount, creator_) returns (uint256 shares) {
+            emit CreatorLpStaked(token, creator_, amount, shares, block.timestamp);
+        } catch {
+            usdc.forceApprove(vault, 0);
+            Market storage m = _markets[token];
+            m.creatorLpPendingUsdc += amount;
+            m.vaultBalanceUsdc += amount;
+        }
     }
 
     /// Vault balance beyond everything the market could owe: reserved funds,
     /// open collateral (plus a buffer for rounding and funding drift),
-    /// deferred payouts and open positions' net unrealized profit.
+    /// deferred payouts and winning positions' open profit.
     function _surplus(Market memory m) internal view returns (uint256) {
-        int256 open = _aggregatePnl(m);
+        (uint256 winners,) = _sidePnl(m, m.markPriceE6);
         uint256 owed = _reserved(m) + m.collateralPoolUsdc
-            + (m.collateralPoolUsdc * _counterflowConfig.surplusBufferBps) / 10_000 + m.unsettledProfitTotalUsdc
-            + (open > 0 ? uint256(open) : 0);
+            + (m.collateralPoolUsdc * _lpConfig.surplusBufferBps) / 10_000 + m.unsettledProfitTotalUsdc + winners;
         return _subFloor(m.vaultBalanceUsdc, owed);
     }
 
-    /// Asks Counterflow to cover `amount` for a backed market; credits what it pays.
+    /// Profit pool on an oracle market: its free funds (beyond reserved funds,
+    /// collateral and deferred payouts; less `owedNow` about to be paid out)
+    /// plus what's left of the vault's profit budget.
+    function _profitPool(Market memory m, uint256 vaultCash, uint256 owedNow) internal view returns (uint256) {
+        int256 free = _freeFunds(m) - int256(owedNow);
+        return (free > 0 ? uint256(free) : 0) + _lpBudget(m, vaultCash);
+    }
+
+    /// What the vault may still pay this market: `lpProfitBudgetBps` of its
+    /// capital (cash plus what the market has drawn and not repaid), less what
+    /// the market has drawn. Spending it moves cash into the market one for one,
+    /// so a draw never grows the pool, and the vault's exposure stays within the
+    /// budget until the market repays it.
+    function _lpBudget(Market memory m, uint256 vaultCash) internal view returns (uint256) {
+        uint256 drawn = m.counterflowDrawnUsdc;
+        return _subFloor(((vaultCash + drawn) * _lpConfig.lpProfitBudgetBps) / 10_000, drawn);
+    }
+
+    function _freeFunds(Market memory m) internal pure returns (int256) {
+        return int256(m.vaultBalanceUsdc) - int256(_reserved(m) + m.collateralPoolUsdc + m.unsettledProfitTotalUsdc);
+    }
+
+    /// Open PnL of each side at `priceE6`, split into winners' profit and losers' loss.
+    function _sidePnl(Market memory m, uint256 priceE6) internal pure returns (uint256 winners, uint256 losers) {
+        int256 longs = int256(PerpesMath.baseValue(m.baseLong, priceE6, false)) - int256(m.oiLongUsdc);
+        int256 shorts = int256(m.oiShortUsdc) - int256(PerpesMath.baseValue(m.baseShort, priceE6, true));
+        winners = (longs > 0 ? uint256(longs) : 0) + (shorts > 0 ? uint256(shorts) : 0);
+        losers = (longs < 0 ? uint256(-longs) : 0) + (shorts < 0 ? uint256(-shorts) : 0);
+    }
+
+    /// Open winners' profit and losers' loss, per side: at the mark on oracle
+    /// markets; on primary markets what each side would realize unwinding
+    /// through the curve — the mark is only the marginal price there, so in a
+    /// one-sided pump every position looks like a winner at it.
+    function _openPnl(Market memory m) internal pure returns (uint256 winners, uint256 losers) {
+        if (m.status == MarketStatus.Graduated) return _sidePnl(m, m.markPriceE6);
+        int256 longs;
+        int256 shorts;
+        if (m.baseLong > 0) {
+            longs = int256(PerpesMath.closeLong(m.vammQuoteReserve, m.vammBaseReserve, m.vammK, m.baseLong).quoteAmount)
+                - int256(m.oiLongUsdc);
+        }
+        if (m.baseShort > 0) {
+            // More base than the curve holds can't be bought back: count the
+            // shorts' whole collateral as at risk.
+            shorts = m.baseShort < m.vammBaseReserve
+                ? int256(m.oiShortUsdc)
+                    - int256(PerpesMath.closeShort(m.vammQuoteReserve, m.vammBaseReserve, m.vammK, m.baseShort).quoteAmount)
+                : -int256(m.collateralPoolUsdc);
+        }
+        winners = (longs > 0 ? uint256(longs) : 0) + (shorts > 0 ? uint256(shorts) : 0);
+        losers = (longs < 0 ? uint256(-longs) : 0) + (shorts < 0 ? uint256(-shorts) : 0);
+    }
+
+    function _winnersAtMark(Market memory m) internal pure returns (uint256 winners) {
+        (winners,) = _openPnl(m);
+    }
+
+    /// Share of their profit (bps) winners would be paid closing now: all of
+    /// it while every winner's open profit fits the payout pool, else pool ÷
+    /// winners' profit — the same for everyone, whoever closes first.
+    function payoutRatioBps(address token) external view returns (uint256) {
+        Market memory m = previewMarket(token);
+        uint256 winners = _winnersAtMark(m);
+        if (winners == 0) return 10_000;
+        uint256 pool = _payoutPool(token, m, 0);
+        return pool >= winners ? 10_000 : (pool * 10_000) / winners;
+    }
+
+    /// The market's equity — what belongs to its vault — with open PnL valued
+    /// at `priceE6` and the vault holding `vaultCash`: free funds, plus what
+    /// losing positions owe, minus what winners can claim (their profit, up to
+    /// the profit pool). Never below −(the vault's profit budget).
+    function _marketEquity(Market memory m, uint256 priceE6, uint256 vaultCash) internal view returns (int256) {
+        (uint256 winners, uint256 losers) = _sidePnl(m, priceE6);
+        uint256 pool = _profitPool(m, vaultCash, 0);
+        return _freeFunds(m) + int256(losers) - int256(winners < pool ? winners : pool);
+    }
+
+    /// USDC the market's vault holds (0 without one).
+    function _lpCash(address token) internal view returns (uint256) {
+        address vault = lpVault[token];
+        return vault == address(0) ? 0 : usdc.balanceOf(vault);
+    }
+
+    /// Asks the market's vault to cover `amount`, up to what's left of its
+    /// profit budget (`_lpBudget`); credits what it pays.
     function _drawCounterflow(address token, Market memory m, uint256 amount) internal returns (uint256 paid) {
-        if (amount == 0 || !_secondary[token].backed) return 0;
-        address vault = _counterflowConfig.vault;
+        address vault = lpVault[token];
         if (vault == address(0)) return 0;
+        uint256 budget = _lpBudget(m, usdc.balanceOf(vault));
+        if (amount > budget) amount = budget;
+        if (amount == 0) return 0;
         // A vault failure must never block a close or a liquidation: no cover, the
         // usual deferral applies. Only USDC that actually arrived is credited.
         uint256 before = usdc.balanceOf(address(this));
-        try ICounterflowV1(vault).cover(token, amount) returns (uint256) {
+        try ICounterflow(vault).cover(amount) returns (uint256) {
             paid = usdc.balanceOf(address(this)) - before;
         } catch {
             return 0;
@@ -2074,24 +2313,36 @@ contract PerpesEngineV3 is
         if (c.poolFee != s.cfg.poolFee || c.tickSpacing != s.cfg.tickSpacing) revert InvalidConfig();
         _validateSecondaryConfig(c);
         s.cfg = c;
-        if (s.active) _deriveFromLiquidity(s);
+        if (s.active) _deriveFromLiquidity(token, s);
         emit SecondaryConfigUpdated(msg.sender, block.timestamp);
     }
 
-    function _setSpotLiquidity(Secondary storage s, uint256 spotLiquidityUsdc) internal {
+    function _setSpotLiquidity(address token, Secondary storage s, uint256 spotLiquidityUsdc) internal {
         s.spotLiquidityUsdc = spotLiquidityUsdc;
         s.lastLiquidityTs = uint64(block.timestamp);
-        _deriveFromLiquidity(s);
+        _deriveFromLiquidity(token, s);
     }
 
     /// Skew scale and OI cap follow the spot depth and the market's multipliers.
-    function _deriveFromLiquidity(Secondary storage s) internal {
+    /// The market's vault deepens it on top — by `lpOiMultiplier` × its cash, up
+    /// to `backedDepthMultiplier` × pool depth in all — so what traders can win
+    /// grows with what backs them, while the pool depth (the cost of moving the
+    /// oracle) still bounds it.
+    function _deriveFromLiquidity(address token, Secondary storage s) internal {
         SecondaryConfig storage c = s.cfg;
-        // Backing deepens the market: a larger skew scale (smaller premium) and OI cap.
-        uint256 skewMult = c.virtualLiqMultiplier;
-        if (s.backed && _counterflowConfig.backedOiMultiplier > skewMult) skewMult = _counterflowConfig.backedOiMultiplier;
-        s.skewScaleUsdc = PerpesSecondaryMath.skewScaleUsdc(s.spotLiquidityUsdc, skewMult, c.minVirtualLiquidityUsdc);
-        s.maxOiUsdc = s.spotLiquidityUsdc * _oiMultiplier(s);
+        LpConfig storage lc = _lpConfig;
+        uint256 extra;
+        if (lc.backedDepthMultiplier > c.maxOiMultiplier) {
+            extra = _min(
+                s.spotLiquidityUsdc * (lc.backedDepthMultiplier - c.maxOiMultiplier), _lpCash(token) * lc.lpOiMultiplier
+            );
+        }
+        s.lpDepthUsdc = extra;
+        s.backed = extra > 0;
+        s.skewScaleUsdc = PerpesSecondaryMath.skewScaleUsdc(
+            s.spotLiquidityUsdc, c.virtualLiqMultiplier, c.minVirtualLiquidityUsdc
+        ) + extra;
+        s.maxOiUsdc = s.spotLiquidityUsdc * c.maxOiMultiplier + extra;
     }
 
     // ── Internals: loading / storing ───────────────────────────────────────────
@@ -2211,15 +2462,11 @@ contract PerpesEngineV3 is
             PerpesSecondaryMath.markPriceE6(m.indexPriceE6, _skew(m), s.skewScaleUsdc, c.maxMarkDeviationBps);
     }
 
+    /// Pool depth × multiplier plus what the market's vault adds (see
+    /// `_deriveFromLiquidity`), quartered while the velocity breaker is tripped.
     function _secondaryMaxOi(Secondary storage s) internal view returns (uint256) {
-        return PerpesSecondaryMath.maxOiUsdc(s.spotLiquidityUsdc, _oiMultiplier(s), s.velocityTripped);
-    }
-
-    /// Counterflow-backed markets can carry more OI per dollar of pool depth.
-    function _oiMultiplier(Secondary storage s) internal view returns (uint256) {
-        uint256 base = s.cfg.maxOiMultiplier;
-        uint256 backed = _counterflowConfig.backedOiMultiplier;
-        return s.backed && backed > base ? backed : base;
+        uint256 cap = s.spotLiquidityUsdc * s.cfg.maxOiMultiplier + s.lpDepthUsdc;
+        return s.velocityTripped ? cap / 4 : cap;
     }
 
     function _checkOpenCaps(address token, Market memory m, uint256 incoming) internal view {
@@ -2346,12 +2593,16 @@ contract PerpesEngineV3 is
 
     /// Settles funding into collateral and latches `pendingLiquidation` the first
     /// time the position is seen below maintenance (never cleared by recovery).
+    /// The market's collateral pool moves with it, so funding a position pays
+    /// stops counting as owed to traders (it's the market's — its vault's).
     function _settle(Position memory p, Market memory m) internal pure {
         int256 pending = PerpesMath.pendingFunding(p.side == Side.Long, p.sizeUsdc, m.fundingIndexE9, p.lastFundingIndexE9);
         if (pending >= 0) {
             p.collateralUsdc += uint256(pending);
+            m.collateralPoolUsdc += uint256(pending);
         } else {
             uint256 debit = uint256(-pending);
+            m.collateralPoolUsdc = _subFloor(m.collateralPoolUsdc, _min(debit, p.collateralUsdc));
             if (debit > p.collateralUsdc) {
                 // Owes more than its collateral: take it all and carry the rest
                 // by leaving the funding marker behind (pendingFunding keeps
@@ -2493,8 +2744,8 @@ contract PerpesEngineV3 is
 
     /// Shared tail of every voluntary close: realizes PnL on the closed slice.
     /// A loss beyond the released collateral comes out of the remaining
-    /// collateral, then insurance, then bad debt. Principal is paid in full
-    /// while the vault has headroom; anything unpaid is deferred, never forfeited.
+    /// collateral, then insurance, then bad debt. Principal is paid in full;
+    /// profit pro rata to the payout pool (`_paidProfit`), the rest forfeited.
     /// Debits `vaultBalanceUsdc` by the amount paid; the caller transfers it.
     function _settleClose(CloseSlice memory c, Market memory m, Position memory p, Fill memory fill)
         internal
@@ -2519,18 +2770,11 @@ contract PerpesEngineV3 is
             uint256 v = value > 0 ? uint256(value) : 0;
             uint256 principal = _min(v, c.released);
             uint256 deferred;
-            // Primary: no profit throttle — on the curve traders' PnL nets to
-            // zero, so only the headroom cap applies. Oracle markets: the vault
-            // is the counterparty to net skew, so profit is throttled by how
-            // much of the vault open profit already claims — unless Counterflow
-            // backs the market, which then covers what the vault can't pay.
-            bool backed = _secondary[c.token].backed;
-            if (backed && v > _headroom(m)) _drawCounterflow(c.token, m, v - _headroom(m));
-            uint256 headroom = _headroom(m);
-            uint256 claimRatio = (m.status == MarketStatus.Graduated && !backed)
-                ? PerpesSecondaryMath.claimRatioBps(PerpesSecondaryMath.utilizationBps(_aggregatePnl(m), headroom))
-                : 10_000;
-            (payNow, deferred) = PerpesMath.splitClosePayout(principal, v - principal, claimRatio, headroom);
+            if (m.status == MarketStatus.Graduated) {
+                (payNow, deferred) = _oraclePayout(c, m, v, principal);
+            } else {
+                (payNow, deferred) = _primaryPayout(c, m, v, principal);
+            }
             m.vaultBalanceUsdc -= payNow;
             if (deferred > 0) {
                 _deferPayout(c.token, c.owner, m, p, deferred);
@@ -2538,6 +2782,83 @@ contract PerpesEngineV3 is
             }
         }
         emit PositionClosed(c.owner, c.token, c.side, c.costBasis, fill.priceE6, payNow, fee, pnl, block.timestamp);
+    }
+
+    /// Oracle markets: collateral comes back in full; profit is paid pro rata to
+    /// what the market and its vault's profit budget can pay, and the rest is
+    /// forfeited to the market (its LPs). The vault covers what the market's own
+    /// funds can't; only if it fails to pay is the remainder owed (deferred).
+    function _oraclePayout(CloseSlice memory c, Market memory m, uint256 v, uint256 principal)
+        internal
+        returns (uint256 payNow, uint256 deferred)
+    {
+        payNow = principal + _paidProfit(c, m, v, principal);
+        // Paid from the market's free funds (this slice's collateral included),
+        // then the vault — never from other traders' collateral.
+        uint256 own = _freeOrZero(m);
+        if (payNow > own) {
+            _drawCounterflow(c.token, m, payNow - own);
+            own = _freeOrZero(m);
+            if (payNow > own) {
+                deferred = payNow - own;
+                payNow = own;
+            }
+        }
+    }
+
+    /// Primary markets: the same pro-rata rule, but winners' counterparty is
+    /// the losers on the curve, so the pool also counts losers' open loss (held
+    /// in their collateral) and payouts may draw on it. On the curve that pool
+    /// covers every winner unless losses ran past collateral; the IOU is only a
+    /// fallback for cash the market doesn't hold.
+    function _primaryPayout(CloseSlice memory c, Market memory m, uint256 v, uint256 principal)
+        internal
+        returns (uint256 payNow, uint256 deferred)
+    {
+        payNow = principal + _paidProfit(c, m, v, principal);
+        uint256 headroom = _headroom(m);
+        if (payNow > headroom) {
+            deferred = payNow - headroom;
+            payNow = headroom;
+        }
+    }
+
+    /// The share of a closing slice's profit paid: `profit × pool ÷ claims`
+    /// when the pool falls short, the rest forfeited (PayoutHaircut). Claims:
+    /// every winner before this close, or the rest plus what this close
+    /// realized (a fill into the skew can beat the mark), whichever is larger.
+    /// The pool (`_payoutPool`) is measured now, after this close's fees and
+    /// less its principal. Paying that share never exceeds the pool and never
+    /// lowers the ratio left for the remaining winners.
+    function _paidProfit(CloseSlice memory c, Market memory m, uint256 v, uint256 principal)
+        internal
+        returns (uint256 paid)
+    {
+        uint256 profit = v - principal;
+        paid = profit;
+        if (profit == 0) return 0;
+        (uint256 rest,) = _openPnl(m);
+        uint256 claims = rest + profit > c.winnersBefore ? rest + profit : c.winnersBefore;
+        uint256 pool = _payoutPool(c.token, m, principal);
+        if (pool < claims) paid = (profit * pool) / claims;
+        if (paid < profit) emit PayoutHaircut(c.owner, c.token, v, principal + paid, profit - paid, block.timestamp);
+    }
+
+    /// What winners' profit is paid from, less `owedNow` about to go out.
+    /// Oracle markets: free funds plus what's left of the vault's budget.
+    /// Primary markets: free funds plus losers' unwind loss (up to the
+    /// collateral that holds it) — free funds may be negative after winners
+    /// were paid from that collateral, and then count against it.
+    function _payoutPool(address token, Market memory m, uint256 owedNow) internal view returns (uint256) {
+        if (m.status == MarketStatus.Graduated) return _profitPool(m, _lpCash(token), owedNow);
+        (, uint256 losers) = _openPnl(m);
+        int256 pool = _freeFunds(m) - int256(owedNow) + int256(_min(losers, m.collateralPoolUsdc));
+        return pool > 0 ? uint256(pool) : 0;
+    }
+
+    function _freeOrZero(Market memory m) internal pure returns (uint256) {
+        int256 free = _freeFunds(m);
+        return free > 0 ? uint256(free) : 0;
     }
 
     /// Pays `amount` (already debited from the stored vault) to `to`. If the token
@@ -2569,22 +2890,24 @@ contract PerpesEngineV3 is
         uint256 closeNotional,
         uint16 maxSlippageBps
     ) internal returns (uint256 payout, uint256 fillPriceE6) {
-        Side side = p.side;
-        uint256 debt = _fundingDebt(p, m, closeNotional);
+        CloseSlice memory c = CloseSlice(
+            token, owner_, p.side, closeNotional, 0, _fundingDebt(p, m, closeNotional), _winnersAtMark(m)
+        );
         uint64 lastTouch = p.lastUpdateTs;
-        (uint256 base, uint256 released) = _reduceAmounts(p, closeNotional);
+        uint256 base;
+        (base, c.released) = _reduceAmounts(p, closeNotional);
         uint256 priceBefore = _referencePrice(m);
-        Fill memory fill = _closeFill(token, m, side, base, closeNotional);
-        _checkSlippage(_opposite(side), priceBefore, fill.priceE6, maxSlippageBps);
-        _applyReduce(p, m, closeNotional, base, released);
+        Fill memory fill = _closeFill(token, m, c.side, base, closeNotional);
+        _checkSlippage(_opposite(c.side), priceBefore, fill.priceE6, maxSlippageBps);
+        _applyReduce(p, m, closeNotional, base, c.released);
         // Graduated: a close in the same second as the position's last change
         // must not be profitable, so premium/rounding can't be round-tripped.
         if (
             m.status == MarketStatus.Graduated && lastTouch == block.timestamp
-                && _signedPnl(side, closeNotional, fill.quote) > 0
+                && _signedPnl(c.side, closeNotional, fill.quote) > 0
         ) revert ImmediateRoundtripProfit();
         _afterFill(token, m);
-        (payout,) = _settleClose(CloseSlice(token, owner_, side, closeNotional, released, debt), m, p, fill);
+        (payout,) = _settleClose(c, m, p, fill);
         fillPriceE6 = fill.priceE6;
     }
 
@@ -2601,18 +2924,19 @@ contract PerpesEngineV3 is
         return side == Side.Long ? int256(exitQuote) - int256(costBasis) : int256(costBasis) - int256(exitQuote);
     }
 
-    /// Vault balance that isn't trader money: insurance plus unclaimed fees
-    /// (Counterflow's share included).
+    /// Vault balance that isn't trader or LP money: insurance plus unclaimed
+    /// fees (the creator's set-aside vault deposit included).
     function _reserved(Market memory m) internal pure returns (uint256) {
-        return m.insuranceTrancheUsdc + m.creatorFeesPendingUsdc + m.protocolFeesPendingUsdc + m.counterflowPendingUsdc;
+        return m.insuranceTrancheUsdc + m.creatorFeesPendingUsdc + m.protocolFeesPendingUsdc + m.creatorLpPendingUsdc;
     }
 
     function _headroom(Market memory m) internal pure returns (uint256) {
         return _subFloor(m.vaultBalanceUsdc, _reserved(m));
     }
 
-    /// A loss beyond a position's collateral: insurance first, then (backed
-    /// markets) Counterflow, and only the rest is bad debt.
+    /// A loss beyond a position's collateral: insurance first (primary markets;
+    /// oracle markets hold none), then the market's Counterflow vault, and only
+    /// the rest is bad debt.
     function _coverShortfall(address token, Market memory m, uint256 shortfall) internal {
         uint256 covered = _min(shortfall, m.insuranceTrancheUsdc);
         m.insuranceTrancheUsdc -= covered;
@@ -2628,11 +2952,29 @@ contract PerpesEngineV3 is
         emit PayoutDeferred(owner_, token, amount, p.unsettledProfitUsdc, block.timestamp);
     }
 
-    /// Three-way fee split: creator (two-tier), static insurance cut, protocol
-    /// remainder. The creator's qualified rate unlocks if the market reaches the
-    /// volume threshold within the window; once latched it stays.
+    /// Primary markets: creator (two-tier), static insurance cut, protocol
+    /// remainder — the creator's qualified rate unlocks if the market reaches
+    /// the volume threshold within the window; once latched it stays.
+    /// Oracle markets: the LP config's split (70% LPs / 20% creator / 10%
+    /// protocol by default), no insurance. The LP share stays in the market as
+    /// its vault's equity (swept by syncCounterflow; with nobody in the vault yet
+    /// it goes to the protocol at the first deposit). `creatorLpBps` of the
+    /// creator's share is set aside for a vault deposit in their name.
     function _accrueFee(Market memory m, address token, address trader, uint256 fee) internal {
         if (fee == 0) return;
+        m.totalFeesCollectedUsdc += fee;
+        if (m.status == MarketStatus.Graduated) {
+            LpConfig storage lc = _lpConfig;
+            uint256 creatorShare = (fee * lc.creatorFeeBps) / 10_000;
+            uint256 protocolShare = (fee * lc.protocolFeeBps) / 10_000;
+            uint256 stake = (creatorShare * m.creatorLpBps) / 10_000;
+            m.creatorFeesPendingUsdc += creatorShare - stake;
+            m.creatorLpPendingUsdc += stake;
+            m.protocolFeesPendingUsdc += protocolShare;
+            emit TradingFeeAccrued(token, trader, fee, creatorShare, 0, protocolShare, m.creatorFeeTierUnlocked, block.timestamp);
+            emit LpFeeAccrued(token, fee - creatorShare - protocolShare, stake, block.timestamp);
+            return;
+        }
         if (
             !m.creatorFeeTierUnlocked && block.timestamp - m.createdAt <= m.creatorFeeWindowSeconds
                 && m.totalVolumeUsdc >= m.creatorFeeVolumeThresholdUsdc
@@ -2640,14 +2982,10 @@ contract PerpesEngineV3 is
         uint256 creatorBps = m.creatorFeeTierUnlocked ? m.creatorFeeBps : m.creatorFeeBpsUnqualified;
         uint256 creatorCut = (fee * creatorBps) / 10_000;
         uint256 insuranceCut = (fee * m.insuranceFeeBpsStatic) / 10_000;
-        // Backed markets: Counterflow's share comes out of the protocol's cut.
-        uint256 counterflowCut = _secondary[token].backed ? (fee * _counterflowConfig.feeShareBps) / 10_000 : 0;
-        uint256 protocolCut = fee - creatorCut - insuranceCut - counterflowCut;
-        m.totalFeesCollectedUsdc += fee;
+        uint256 protocolCut = fee - creatorCut - insuranceCut;
         m.creatorFeesPendingUsdc += creatorCut;
         m.insuranceTrancheUsdc += insuranceCut;
         m.protocolFeesPendingUsdc += protocolCut;
-        m.counterflowPendingUsdc += counterflowCut;
         emit TradingFeeAccrued(
             token, trader, fee, creatorCut, insuranceCut, protocolCut, m.creatorFeeTierUnlocked, block.timestamp
         );
