@@ -1,0 +1,7 @@
+{
+  "chainId": 10143,
+  "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+  "poolManager": "0xE1dF5319DCdaB202aCE177d9073c18D37EB4c0c3",
+  "positionManager": "0x547F6456bb9F8dfb32936b0136d482B152E67277",
+  "selfDeployed": true
+}

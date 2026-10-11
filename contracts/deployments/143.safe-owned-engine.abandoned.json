@@ -1,0 +1,12 @@
+{
+  "chainId": 143,
+  "deployBlock": 109904112,
+  "engine": "0x537467A3075Fff8aB4940b5Da5EbBbd7cEb540DD",
+  "engineImplementation": "0x3041Df8446a3984e65824adD692B5d22e6d36336",
+  "mockUsdc": false,
+  "owner": "0x9Df46c2D1b7305b64d8C313504bf51Ed541757CA",
+  "protocolFeeWallet": "0x9Df46c2D1b7305b64d8C313504bf51Ed541757CA",
+  "treasury": "0x9Df46c2D1b7305b64d8C313504bf51Ed541757CA",
+  "usdc": "0x754704Bc059F8C67012fEd69BC8A327a5aafb603",
+  "counterflowVault": "0x3D3725189a78c5A154A192600604c63E16a36106"
+}
