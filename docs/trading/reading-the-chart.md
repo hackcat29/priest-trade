@@ -1,0 +1,46 @@
+# Reading the Chart
+
+The Priest.trade chart interface provides real-time visualization of price action, virtual curve movements, and external spot feeds.
+
+---
+
+## 1. Candlestick Anatomy
+
+Every candlestick on the chart represents the aggregate price movement over your selected time resolution (1m, 5m, 15m, 1h, 4h, 1D):
+
+- **Open:** The price of the first fill during that interval.
+- **High:** The highest price reached during that interval.
+- **Low:** The lowest price reached during that interval.
+- **Close:** The price of the last fill during that interval.
+- **Color:**
+  - **Green Candle:** Close > Open (Bullish upward movement).
+  - **Red Candle:** Close < Open (Bearish downward movement).
+
+---
+
+## 2. Mark Price vs Index Price Line
+
+In perpetuals trading, distinguishing between Mark and Index is vital:
+
+- **Mark Price (Solid Line / Current Candlestick):**
+  - Reflects the real-time execution price of the contract.
+  - On the primary rail, this is the curve price. On the secondary rail, this is the worst-of execution price.
+  - Unrealized PnL is computed against the Mark Price.
+- **Index Price (Dashed Line):**
+  - Reflects the smoothed moving average (EWMA or Uniswap spot oracle).
+  - Used for funding rate accrual and manipulation-resistant liquidation qualification.
+  - If you see a brief wick in the Mark Price that does not move the Index Price, positions are protected from liquidating.
+
+---
+
+## 3. Position Overlays
+
+When you hold open positions or resting limit orders on a market, visual indicators appear directly on the chart:
+
+- **Green Horizontal Line:** Your Long entry price (or Buy limit order).
+- **Red Horizontal Line:** Your Short entry price (or Sell limit order).
+- **Orange Dotted Line:** Your Take Profit level.
+- **Purple Dotted Line:** Your Stop Loss level.
+- **Red Flashing Line:** Your Liquidation Price.
+
+You can drag and drop these lines directly on the chart to adjust your TP/SL trigger levels in real time!

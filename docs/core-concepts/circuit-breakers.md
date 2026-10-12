@@ -1,0 +1,62 @@
+# Circuit Breakers
+
+Circuit breakers are automatic controls that tighten risk settings when markets get wild. They sit in the background during normal trading, but step in when volatility spikes so extreme moves don't break the market or cascade liquidations.
+
+---
+
+## What circuit breakers do
+
+Under normal conditions, you won't notice them at all. When volatility spikes or prices move too fast, they:
+
+- **Lower max leverage** temporarily (e.g. dropping from 40x to 5x or 10x).
+- **Cap open interest** so runaway positions can't overload pool depth.
+- **Bound funding rate moves** so a single spike doesn't drain accounts.
+- **Throttle new opens** until conditions settle down.
+
+They **never close your existing trades** and they **never touch your collateral or PnL**. They simply limit how much new risk can be added while things are chaotic.
+
+---
+
+## What triggers them
+
+On Priest.trade, circuit breakers monitor two primary signals:
+
+### 1. Spot vs average divergence
+On graduated and listed markets, the engine watches the live Uniswap pool price against its own moving average. If the live pool swings more than 25% away from its smoothed average in a short window:
+- Max leverage drops immediately to 5x.
+- Open interest capacity is cut to a quarter of its usual size.
+- This stops traders or bots from exploiting momentary pool wicks.
+
+### 2. Oracle staleness
+If network congestion or keeper delays mean price updates haven't landed in the last 60 seconds:
+- New positions are temporarily blocked.
+- Liquidations are paused so nobody gets liquidated against a frozen, stale price.
+- Normal trading resumes automatically the moment fresh data arrives.
+
+---
+
+## What you see as a trader
+
+When a circuit breaker trips on a market:
+
+- The leverage slider shows a temporarily reduced ceiling.
+- The trade panel shows an alert explaining that volatility limits are active.
+- New large orders might get rejected with a capacity or leverage error.
+
+Your existing position is safe. You can still:
+- Add collateral to improve your health.
+- Close or reduce your position at any time.
+
+---
+
+## Why warmup is different
+
+The 10x leverage cap during a coin's first 24 hours isn't a circuit breaker — it's a built-in warmup period for all new launches. Once the 24 hours pass, the cap moves to 40x. Circuit breakers only kick in when unexpected volatility or price gaps happen later.
+
+---
+
+## See also
+
+- [Liquidations](liquidations.md) — what breakers help prevent.
+- [Insurance Fund](insurance-fund.md) — the per-market backup reserve.
+- [Oracle & Reference Pricing](oracles.md) — how prices are tracked on-chain.

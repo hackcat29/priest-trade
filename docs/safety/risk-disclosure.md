@@ -1,0 +1,43 @@
+# Risk Disclosure
+
+**PLEASE READ THIS RISK DISCLOSURE CAREFULLY BEFORE INTERACTING WITH PRIEST.TRADE.**
+
+Trading leveraged perpetual futures, depositing into liquidity vaults, and launching or trading nascent tokens involves substantial risk of financial loss. You should only trade with capital you can afford to lose completely.
+
+---
+
+## 1. Leverage Risk
+
+Leverage amplifies both profits and losses. While 40x leverage allows you to control a large position with minimal initial margin, it also means that a price move of just **1.25% against your position** can trigger total liquidation and the complete loss of your deposited collateral. High leverage is not suitable for all investors.
+
+---
+
+## 2. Volatility & Liquidation Risk
+
+Emerging tokens, meme coins, and newly launched assets on Monad are subject to violent price swings, low liquidity, and unpredictable market behavior. In fast-moving markets:
+- Market slippage can cause execution prices to diverge significantly from displayed quotes.
+- Gap movements can cause positions to be liquidated rapidly before you can add collateral.
+- While Priest.trade uses dual-price (Mark and Index) liquidation guards to protect against single-block manipulation, sustained directional moves will result in liquidation.
+
+---
+
+## 3. Smart Contract & Blockchain Risk
+
+Priest.trade runs entirely on decentralized smart contracts deployed on the Monad network (`PerpesEngine.sol`, `CounterflowVault.sol`, `PerpesToken.sol`). 
+- While contracts have undergone rigorous internal reviews, fuzz testing, and static analysis, smart contracts carry inherent risk of software bugs, economic vulnerabilities, or unexpected network edge cases.
+- Monad is a high-throughput blockchain architecture; unexpected network delays, validator restarts, or RPC outages could temporarily impede your ability to execute transactions.
+
+---
+
+## 4. Counterflow LP Vault Risk
+
+Depositing USDC into the Counterflow Vault (`cfUSDC`) provides exposure to market making and counterparty backing:
+- While Counterflow earns 30% of platform fees and market surplus, it is also responsible for covering winning payouts when a market vault has a deficit.
+- In sustained market conditions where traders consistently generate net profits, the vault's Net Asset Value (NAV) can decrease.
+- The 3-day redemption cooldown means you cannot withdraw funds instantly during sudden market events.
+
+---
+
+## 5. Regulatory & Jurisdictional Notice
+
+You are solely responsible for ensuring that your access and use of Priest.trade complies with all applicable laws and regulations in your country of residence or citizenship.

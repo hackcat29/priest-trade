@@ -1,0 +1,65 @@
+# Funding Your Account
+
+To interact with Priest.trade, your wallet requires two primary assets:
+
+1. **MON:** The native token of the Monad network, used to pay network gas fees for executing transactions.
+2. **USDC:** Native Circle USDC on Monad (`0x754704Bc059F8C67012fEd69BC8A327a5aafb603`), used as margin collateral for trading perpetuals and for depositing into the Counterflow LP Vault.
+
+---
+
+## 1. Acquiring MON for Gas
+
+Every transaction on Monad (approvals, opening positions, cancelling orders, claiming rewards) consumes a tiny amount of gas paid in MON. Because Monad processes 10,000 transactions per second with low fees, a single MON token can cover hundreds or thousands of transactions.
+
+### On Monad Mainnet
+- **Centralized Exchanges:** Withdraw MON directly to your Monad EVM address from supported exchanges listing MON.
+- **Cross-Chain Bridges:** Use official Monad cross-chain bridges from Ethereum, Arbitrum, Solana, or Base to bridge native ETH/USDC and swap into MON on Monad DEXes.
+
+### On Monad Testnet
+- Obtain free testnet MON from the official Monad faucet:
+  - Visit the official Monad testnet faucet.
+  - Enter your EVM address (`0x...`).
+  - Receive 1–5 testnet MON to cover transaction fees.
+
+---
+
+## 2. Acquiring USDC for Trading Collateral
+
+All perpetual futures positions on Priest.trade are denominated, margined, and settled in **USDC**. 
+
+- **Token Standard:** ERC-20
+- **Decimals:** 6 (`1 USDC = 1,000,000 units` or `1e6`)
+- **Mainnet Contract Address:** `0x754704Bc059F8C67012fEd69BC8A327a5aafb603`
+
+### Why Native Circle USDC?
+Priest.trade integrates native Circle USDC on Monad rather than wrapped or bridge-specific synthetic assets. Native USDC offers:
+- Zero depeg or bridge counterparty risk.
+- Deep liquidity and direct redemptions through Circle.
+- Full fungibility with the broader Monad DeFi ecosystem (Uniswap, lending protocols).
+
+### How to get USDC on Monad Mainnet
+1. **Bridge from other EVM chains:** Use Stargate, Across, or Circle CCTP to bridge USDC directly from Ethereum, Arbitrum, or Base to your Monad address.
+2. **Swap on Monad:** If you have MON or other ecosystem tokens, swap them for USDC on Uniswap on Monad.
+
+---
+
+## 3. Testnet MockUSDC Faucet
+
+On **Monad Testnet**, Priest.trade uses a dedicated `MockUSDC` contract (`0x534EEE2DC77854015A398B9DD6872eF1498B6764`) with a built-in public faucet function.
+
+### How to claim Testnet MockUSDC:
+1. Connect your wallet to [priest.trade](https://priest.trade) on Monad Testnet.
+2. In the top navigation bar, click the **Faucet** button.
+3. Confirm the free mint transaction in your wallet.
+4. You will immediately receive **1,000 MockUSDC** in your wallet ready to trade!
+5. You can also call the faucet directly on-chain via the block explorer:
+   - Call `faucet()` or `mint(address to, uint256 amount)` on `MockUSDC`.
+
+---
+
+## Account Balances & Margin Security
+
+When you trade on Priest.trade:
+- **No Custodial Deposit Account:** Unlike centralized exchanges, you do **not** need to deposit funds into an opaque centralized platform balance before trading.
+- **Per-Trade Margin Pull:** When you open a position, `PerpesEngine` pulls only the specified collateral (`collateralUsdc + fee`) directly from your wallet via ERC-20 transfer.
+- **Isolated Margin:** Each position's margin is isolated in that specific market's vault. When you close your trade, your collateral and profits are transferred directly back to your wallet address.

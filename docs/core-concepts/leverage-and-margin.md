@@ -1,0 +1,57 @@
+# Leverage & Margin
+
+Leverage lets you control a larger position than the dollar amount you deposit. This page explains how leverage, initial margin, and maintenance margin work on Priest.trade.
+
+---
+
+## Max leverage tiers
+
+Priest.trade supports up to **40x leverage**:
+
+| Market Phase | Max Leverage | Min Required Collateral | Liquidation Buffer |
+|---|---|---|---|
+| **Warmup (first 24h)** | **10x** | 10.0% of position value | ~5.0% price move |
+| **Active vAMM** | **40x** | 2.5% of position value | ~1.25% price move |
+| **Graduated (day 1)** | **15x** | 6.7% of position value | ~3.3% price move |
+| **Graduated (day 2)** | **20x** | 5.0% of position value | ~2.5% price move |
+| **Graduated (day 6+)** | **40x** | 2.5% of position value | ~1.25% price move |
+
+> **Why leverage steps up after graduation:** When a market first moves to real Uniswap spot liquidity, leverage starts at 15x and unlocks by 5x each day. This gives spot LPs time to build depth before full 40x leverage is unleashed.
+
+---
+
+## Initial margin vs maintenance margin
+
+- **Initial Margin:** What you need to put down to open the trade. At 40x leverage, opening a $1,000 trade requires $25 in USDC margin ($1,000 / 40).
+- **Maintenance Margin:** The minimum equity you must hold to stay open. On Priest.trade, maintenance margin is half of your initial requirement (1.25% at 40x). If your remaining collateral plus PnL drops below that, you get liquidated.
+
+---
+
+## Position equity and margin ratio
+
+Your account health boils down to one simple equation:
+
+$$\text{Equity} = \text{Collateral} + \text{Unrealized PnL} - \text{Owed Funding}$$
+
+$$\text{Margin Ratio} = \frac{\text{Equity}}{\text{Total Position Size}}$$
+
+- **Healthy:** Margin ratio is well above 1.25%.
+- **At risk:** Margin ratio is approaching 1.25%. Add collateral or reduce your position.
+- **Liquidated:** Margin ratio drops below 1.25%.
+
+---
+
+## Adding and removing margin
+
+You can adjust your collateral while a trade is open:
+
+- **Adding margin (`+`):** Transfers USDC from your wallet into your trade. This boosts your margin ratio and moves your liquidation price farther away.
+- **Removing margin (`-`):** Returns excess collateral back to your wallet. You can only remove collateral if your remaining balance still meets initial margin rules. You cannot withdraw unrealized paper profits while keeping the position open.
+
+---
+
+## See also
+
+- [Liquidations](liquidations.md) — what happens when margin runs out.
+- [Placing Orders](../trading/placing-orders.md) — opening your first position.
+- [Take Profit & Stop Loss](../trading/tp-sl-orders.md) — protecting your margin with automated exits.

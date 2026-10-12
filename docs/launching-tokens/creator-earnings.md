@@ -1,0 +1,44 @@
+# Creator Earnings
+
+Priest.trade offers the most rewarding fee-sharing model in decentralized perpetuals, sharing up to **50% of protocol trading fees** with token creators and listers.
+
+---
+
+## 1. The Fee Tiers
+
+Trading fees on Priest.trade are 0.10% (10 bps) of notional volume. How much of this fee the creator receives depends on the market's qualification tier:
+
+| Creator Tier | Fee Split | Effective Earning | Requirement |
+|---|---|---|---|
+| **Base / Unqualified** | **25%** of fees | **0.025%** of volume ($250 per $1M vol) | Default from block zero |
+| **Qualified Creator Tier** | **50%** of fees | **0.050%** of volume ($500 per $1M vol) | $\ge \$100,000$ volume within first 30 days |
+
+---
+
+## 2. The $100k Qualification Gate
+
+To encourage genuine community building and discourage spam tokens:
+- A market must reach at least **$100,000 in cumulative notional volume within 30 days of launch** (`creatorFeeVolumeThresholdUsdc` and `creatorFeeWindowSeconds`).
+- Once this threshold is reached, `creatorFeeTierUnlocked` flips to `true` permanently.
+- The 50% split remains active for the entire lifetime of the token, even after graduation!
+- If the market fails to hit $100k within 30 days, it remains locked into the 25% base rate indefinitely.
+
+---
+
+## 3. How Earnings Accrue
+
+- Every time any trader opens or closes a position on your market, the creator's share is instantly credited to `market.creatorFeesPendingUsdc` in contract storage.
+- Accrual is completely automated and non-custodial.
+- Your earnings are backed 1:1 by real USDC in the market's vault.
+
+---
+
+## 4. How to Claim Your Earnings
+
+You can claim your accumulated fees at any time:
+
+1. Open the **Creator Dashboard** at [priest.trade](https://priest.trade).
+2. Review your pending fee balance.
+3. Click **Claim Fees**.
+4. Confirm the transaction calling `claimCreatorFees(token)`.
+5. The full pending balance in USDC will be transferred directly to your creator wallet!

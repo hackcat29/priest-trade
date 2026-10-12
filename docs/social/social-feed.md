@@ -1,0 +1,30 @@
+# Social Feed
+
+Priest.trade is built as a social-first trading venue where market conviction is shared and discussed in real time.
+
+---
+
+## 1. What is the Social Feed?
+
+Every market on Priest.trade includes a live **Social Feed** running directly alongside the order book and chart:
+
+- **Automated Trade Notifications:** Large market orders, liquidations, and major Take Profit executions are broadcast to the feed in real time.
+- **Trader Commentary:** Community members can share their market theses, post technical analysis, and react to market volatility.
+- **Creator Announcements:** Verified token creators can post pinned updates, roadmap milestones, and community links directly to their token's feed.
+
+---
+
+## 2. Participating in the Feed
+
+1. Connect your wallet to [priest.trade](https://priest.trade).
+2. On any trading page, locate the **Chat & Social** tab next to the order dock.
+3. Type your comment or question and click **Send**.
+4. You can mention other traders using `@username` or reference other markets using `$TICKER`.
+
+---
+
+## 3. Moderation & Community Guidelines
+
+Priest.trade values free market discourse and community camaraderie:
+- **Zero Tolerance:** Hate speech, targeted harassment, phishing links, and malicious contract advertisements result in immediate social feed blacklisting.
+- **Verified Badges:** Token creators and top leaderboard traders carry distinct badges, making authentic commentary immediately identifiable.

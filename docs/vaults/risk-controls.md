@@ -1,0 +1,47 @@
+# Risk Controls & Exposure Caps
+
+Counterflow uses clear rules to make sure a single wild market cannot drain the liquidity pool.
+
+---
+
+## 1. Max 10% exposure per market
+
+To stop any single coin from threatening the vault:
+- Counterflow caps its unpaid coverage to at most **10% of total vault NAV** on any one market.
+- If a market reaches this 10% cap, Counterflow pauses further coverage on that specific coin until previous draws are repaid by fee sweeps or trader losses.
+- The rest of the vault's capital remains safe.
+
+---
+
+## 2. Max 50% total exposure
+
+Across all backed markets combined:
+- Total outstanding coverage cannot exceed **50% of the vault's total assets**.
+- At least **50% of the vault's USDC is always sitting as uncommitted cash**, ensuring LPs can process normal withdrawals even during volatile market events.
+
+---
+
+## 3. The 3-day redemption cooldown
+
+Withdrawals require a **3-day cooldown**:
+- You submit a redemption request.
+- The contract locks your shares for 3 days.
+- Once 3 days pass, you claim your USDC at the current share price.
+
+This stops predatory traders from watching a sudden price move and draining the pool right before a loss is settled.
+
+---
+
+## 4. 24-hour profit unlocking
+
+When income (fees or trader losses) is swept into Counterflow:
+- The profit unlocks smoothly over **24 hours**.
+- This stops arbitrage bots from depositing 1 second before a fee sweep and withdrawing right after to steal yield from existing depositors.
+
+---
+
+## See also
+
+- [Counterflow Overview](counterflow-vault.md) — how the vault works.
+- [Depositing & Withdrawing cfUSDC](depositing-and-withdrawing.md) — managing your vault position.
+- [NAV, Yield & Profit Unlocking](nav-and-yield.md) — cash-based accounting.
