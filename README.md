@@ -1,8 +1,10 @@
 # Priest.trade — Monad Metropolis Hackathon Submission
 
-> **Conviction, leveraged. Every coin on Monad gets its own perp market.**
+> **Any token on Monad can have a perpetual market. No application, no allowlist, no approval.**
 
-Priest.trade is the Monad-native perpetuals launchpad and exchange. It unifies fair-launch token mechanics with instant perpetual futures trading, transitioning mature tokens into locked **Uniswap v4** spot liquidity backed by an automated LP vault (**Counterflow**).
+Priest.trade is a perpetuals exchange on Monad where **anyone can list any token as a perp market** in a single transaction. If the token has a Uniswap pool with enough liquidity, a market opens on the spot, priced from that pool by an on-chain oracle. Every listed market gets its own **Counterflow** LP vault that anyone can deposit into, and the person who listed it earns a share of the trading fees.
+
+Priest.trade also includes a fair-launch **launchpad** for creating brand-new tokens with a perp market from day one. It is a secondary feature, described [below](#-secondary-feature-the-launchpad).
 
 [![Monad Mainnet](https://img.shields.io/badge/Monad%20Mainnet-Chain%20ID%20143-8A2BE2.svg)](https://monadvision.com/address/0xdCb4FbCdebBeB3C3D1233EDDBFE21e086acE923d)
 [![Monad Testnet](https://img.shields.io/badge/Monad%20Testnet-Chain%20ID%2010143-4B0082.svg)](https://testnet.monadexplorer.com/address/0x041f3b8A1874E8ceBa41C29782Baba20B38F9c35)
@@ -14,14 +16,18 @@ Priest.trade is the Monad-native perpetuals launchpad and exchange. It unifies f
 
 ## 🏛️ The Problem & Our Solution
 
-Most token launchpads end at a bonding curve with no leverage, forcing communities to wait months for centralized exchanges or deep liquidity pools to short, hedge, or trade. Meanwhile, traditional perpetual DEXes only support a curated allowlist of high-market-cap blue chips.
+Perpetual exchanges only list a short, curated set of large tokens. If you hold or want to short anything else on Monad, you have no way to get leverage or hedge, and no way to bring a market into existence yourself. Someone has to approve it first, and for most tokens that never happens.
 
-**Priest.trade merges both worlds on Monad:**
-1. **Instant Perpetual Markets from Block Zero:** Any token launched on Priest.trade immediately has a live perpetual futures market with up to **40x leverage** (10x warmup cap), funding rates, and on-chain risk protections.
-2. **Permanent Uniswap v4 Graduation:** When a market clears 5 volume and resilience gates, the engine seeds a real Uniswap v4 spot pool and **burns the LP position NFT to `0x...dEaD` forever**, eliminating liquidity rug pulls.
-3. **On-Chain Secondary Engine:** Graduated markets switch to an on-chain oracle with worst-of fills ($\\max$ for buys, $\\min$ for sells) that mathematically neutralizes front-running.
-4. **Counterflow LP Vault (`cfUSDC`):** An ERC-4626 vault that automatically backs graduated markets, earning 30% of platform fees and market surplus with conservative 10% per-market exposure caps and a 3-day withdrawal cooldown.
-5. **Permissionless Listings:** Anyone can list an existing Monad token that has an eligible Uniswap v3 or v4 pool ($\\ge \$25\\text{k}$ depth) and earn creator fees.
+**Priest.trade removes the gatekeeper.** Calling `listMarket(token, params)` on the engine opens a perp market for any Monad token that passes the on-chain checks:
+
+1. **Permissionless listing:** No team approval and no fee by default. The contract checks the token and pool itself and either opens the market or reverts.
+2. **Priced from real spot liquidity:** The token must have a Uniswap **v3** pool (from the configured factory) or a hookless **v4** pool, paired with USDC or WMON, holding at least **$25k** of depth. A v3 pool must also have enough history to produce a TWAP.
+3. **Oracle-based pricing that resists manipulation:** Trades fill at the worse of the oracle price and the pool price (higher for buys, lower for sells), so a trader cannot profit by briefly pushing the pool.
+4. **Lister earns fees:** The wallet that lists the market earns the creator share of its trading fees.
+5. **Its own Counterflow vault:** Each listed market gets a separate ERC-4626 LP vault (`cfUSDC`) that anyone can fund. Vaults are isolated, so one market's losses cannot drain another's.
+6. **Safe start:** New markets default to up to **10x** leverage, with a short warmup (10 minutes by default) while the oracle settles before new positions open.
+
+All defaults live in [`contracts/script/Defaults.sol`](contracts/script/Defaults.sol) and can be tuned by the protocol owner. The listing code is `PerpesEngine.listMarket` in [`contracts/src/PerpesEngine.sol`](contracts/src/PerpesEngine.sol), with tests in [`contracts/test/Listing.t.sol`](contracts/test/Listing.t.sol).
 
 ---
 
@@ -36,35 +42,42 @@ Priest.trade is engineered from the ground up for Monad's architecture:
 
 ## 📐 Architecture
 
+### Main path: list any Monad token
+
 ```
-                          ┌───────────────────────────┐
-                          │   Token Launch / Listing  │
-                          └─────────────┬─────────────┘
-                                        │
-                ┌───────────────────────┴───────────────────────┐
-                ▼                                               ▼
-    [ Launch New Token ]                               [ List Existing Token ]
-    • 100% supply minted to engine                     • Requires >= $25k depth on Uniswap
-    • Zero creator pre-mine                            • Trades directly on Secondary Rail
-    • Primary Rail (vAMM Curve)                        • Oracle pricing against spot pool
-    • Up to 40x leverage (10x in 24h warmup)           • Earns creator fee share
-                │
-                │ Clears 5 Gates:
-                │ $2M Vol, 50 Traders, Funding Stability,
-                │ 7+ Days Resilience, Fair-Launch Lock
-                ▼
-    [ Graduation into Uniswap v4 ]
-    • Protocol seeds full-range Uniswap v4 pool
-    • Position NFT minted to 0x...dEaD (LP burned)
-    • Remaining unminted token supply burned
-                │
-                ▼
-    [ Secondary Market Engine ]
-    • On-chain Uniswap v4 EMA / v3 TWAP
-    • Worst-of execution pricing (slippage immunity)
-    • Skew premium + 10 bps spread
-    • Backed by Counterflow LP Vault (cfUSDC)
+   Any ERC-20 on Monad with a Uniswap v3 / v4 pool (>= $25k depth)
+                          │
+                          │  engine.listMarket(token, params)   (anyone, one transaction)
+                          ▼
+   [ Perp market opens ]
+   • Price from the token's own Uniswap pool (v4 EMA / v3 TWAP)
+   • Fills at the worse of oracle and pool price
+   • Premium for open-interest skew + 10 bps spread
+   • Lister earns the creator share of fees
+                          │
+                          ▼
+   [ Counterflow vault for that market ]
+   • ERC-4626 (cfUSDC), open to any depositor
+   • Isolated per market, backs traders' profits
 ```
+
+---
+
+## 🚀 Secondary Feature: The Launchpad
+
+For tokens that don't exist yet, Priest.trade can also launch one. The new token has a perp market from its first block, and it moves through two stages:
+
+1. **Primary stage (virtual curve):** 100% of supply is minted to the engine with no creator pre-mine. Trading runs against a virtual AMM curve, with up to 40x leverage after a 24-hour warmup at 10x.
+2. **Secondary stage (Uniswap graduation):** Once a market clears the graduation gates ($2M volume, 50 traders, stable funding, 7+ days of resilience, fair-launch lock), the engine seeds a full-range **Uniswap v4** pool and sends the LP position NFT to `0x...dEaD`, so the liquidity can never be pulled. Unminted supply is burned, and the market then runs on the same oracle-priced engine as every listed token.
+
+```
+   [ Launch new token ]  →  [ Primary: virtual curve ]  →  5 graduation gates
+                                                              │
+                                                              ▼
+                         [ Secondary: Uniswap v4 pool, LP burned, oracle pricing ]
+```
+
+A graduated launchpad market is functionally the same as a listed one, which is why listing is the main path and the launchpad is an optional on-ramp.
 
 ---
 
