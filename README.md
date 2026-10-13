@@ -116,6 +116,23 @@ Upon graduation:
 
 ---
 
+## 📱 Priest.trade Mobile (iOS & Android)
+
+Priest.trade includes a full-featured cross-platform mobile application engineered with **React Native** and **Expo** for high-performance mobile perpetuals trading on Monad:
+
+- **Permissionless Listing On-the-Go:** Paste any Monad ERC-20 contract address to verify Uniswap v3/v4 pool depth and launch a live perp market in seconds.
+- **Mobile Perpetuals Terminal:** Interactive candlestick charts, real-time order book depth, 40x leverage slider, and one-tap TP/SL trigger configuration.
+- **Counterflow Vault Staking:** Deposit USDC into isolated ERC-4626 `cfUSDC` vaults to earn protocol fee yield directly from your phone.
+- **Non-Custodial & Social Logins:** Connect seamlessly via MetaMask, Rabby, Privy social login, or hardware wallets.
+
+<p align="center">
+  <img src="assets/mobile/trade_screen.jpg" width="31%" alt="Mobile Trading Terminal" />
+  <img src="assets/mobile/listing_screen.jpg" width="31%" alt="Permissionless Listing & Counterflow" />
+  <img src="assets/mobile/discover_screen.jpg" width="31%" alt="Markets & Fair Launches" />
+</p>
+
+---
+
 ## 📜 Deployed Contracts
 
 ### Monad Mainnet (Chain ID: `143`)
@@ -156,6 +173,10 @@ The core engine was subjected to an extensive internal security review and stati
 
 ## 📦 Repository Structure
 
+- **`mobile/`**: React Native & Expo cross-platform mobile trading terminal for iOS and Android.
+  - `src/app/`: Expo Router screens (Trading, Permissionless Listing, Counterflow Vault, Launchpad).
+  - `src/components/`: Real-time orderbook, interactive candlestick charts, and leverage slider.
+  - `src/hooks/`: Monad-native wallet, market state, and position management.
 - **`contracts/`**: Complete Solidity smart contracts, Foundry scripts, and test suite.
   - `src/PerpesEngine.sol`: The core perpetuals engine, vAMM, permissionless listing, and secondary orchestrator.
   - `src/CounterflowVault.sol`: The ERC-4626 `cfUSDC` LP vault.
@@ -198,6 +219,13 @@ MONAD_MAINNET_FORK_RPC=https://rpc.monad.xyz forge test --match-contract MonadFo
 ```bash
 pnpm install
 pnpm build
+```
+
+### 4. Run Mobile Application
+```bash
+cd mobile
+pnpm install
+pnpm start
 ```
 
 ---
