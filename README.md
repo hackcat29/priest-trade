@@ -1,10 +1,8 @@
 # Priest.trade — Monad Metropolis Hackathon Submission
 
-> **Any token on Monad can have a perpetual market. No application, no allowlist, no approval.**
+> **Permissionless perpetual markets for any token on Monad — instant leverage from block zero & permissionless listing for existing tokens.**
 
-Priest.trade is a perpetuals exchange on Monad where **anyone can list any token as a perp market** in a single transaction. If the token has a Uniswap pool with enough liquidity, a market opens on the spot, priced from that pool by an on-chain oracle. Every listed market gets its own **Counterflow** LP vault that anyone can deposit into, and the person who listed it earns a share of the trading fees.
-
-Priest.trade also includes a fair-launch **launchpad** for creating brand-new tokens with a perp market from day one. It is a secondary feature, described [below](#-secondary-feature-the-launchpad).
+Priest.trade is the Monad-native perpetuals exchange and launchpad. It enables **anyone to list any token on Monad into a live perpetual futures market permissionlessly**, while also featuring a complete **fair-launch token launchpad** where new coins trade with instant leverage from day one and graduate into locked **Uniswap v4** spot liquidity backed by an automated LP vault (**Counterflow**).
 
 [![Monad Mainnet](https://img.shields.io/badge/Monad%20Mainnet-Chain%20ID%20143-8A2BE2.svg)](https://monadvision.com/address/0xdCb4FbCdebBeB3C3D1233EDDBFE21e086acE923d)
 [![Monad Testnet](https://img.shields.io/badge/Monad%20Testnet-Chain%20ID%2010143-4B0082.svg)](https://testnet.monadexplorer.com/address/0x041f3b8A1874E8ceBa41C29782Baba20B38F9c35)
@@ -16,25 +14,44 @@ Priest.trade also includes a fair-launch **launchpad** for creating brand-new to
 
 ## 🏛️ The Problem & Our Solution
 
-Perpetual exchanges only list a short, curated set of large tokens. If you hold or want to short anything else on Monad, you have no way to get leverage or hedge, and no way to bring a market into existence yourself. Someone has to approve it first, and for most tokens that never happens.
+Traditional perpetual DEXes only support a curated allowlist of high-market-cap blue chips, leaving long-tail Monad tokens without leverage, hedging, or shorting capabilities. Meanwhile, conventional token launchpads end at bonding curves with zero leverage, leaving communities vulnerable to pump-and-dump cycles with no way to hedge.
 
-**Priest.trade removes the gatekeeper.** Calling `listMarket(token, params)` on the engine opens a perp market for any Monad token that passes the on-chain checks:
+**Priest.trade solves both challenges on Monad:**
 
-1. **Permissionless listing:** No team approval and no fee by default. The contract checks the token and pool itself and either opens the market or reverts.
-2. **Priced from real spot liquidity:** The token must have a Uniswap **v3** pool (from the configured factory) or a hookless **v4** pool, paired with USDC or WMON, holding at least **$25k** of depth. A v3 pool must also have enough history to produce a TWAP.
-3. **Oracle-based pricing that resists manipulation:** Trades fill at the worse of the oracle price and the pool price (higher for buys, lower for sells), so a trader cannot profit by briefly pushing the pool.
-4. **Lister earns fees:** The wallet that lists the market earns the creator share of its trading fees.
-5. **Its own Counterflow vault:** Each listed market gets a separate ERC-4626 LP vault (`cfUSDC`) that anyone can fund. Vaults are isolated, so one market's losses cannot drain another's.
-6. **Safe start:** New markets default to up to **10x** leverage, with a short warmup (10 minutes by default) while the oracle settles before new positions open.
+### 1. Permissionless Token Listing (Any Monad Token)
+Calling `listMarket(token, params)` opens a live perpetual futures market for any existing Monad token in a single on-chain transaction:
+- **Zero Gatekeeping:** No team approval, no governance delays, and zero listing fee by default.
+- **Real Spot Liquidity Grounding:** Requires an existing Uniswap **v3** (from the configured factory) or hookless **v4** pool against USDC or WMON with at least **$25k** pool depth.
+- **Oracle Worst-Of Fill Protection:** Trades execute at the worse of the on-chain oracle and pool price ($\max$ for buys, $\min$ for sells), mathematically preventing oracle manipulation and MEV front-running.
+- **Lister Incentives:** The wallet that lists the token earns the creator share of trading fees.
+- **Isolated Counterflow LP Vault:** Each listed market spawns its own ERC-4626 vault (`cfUSDC`) that anyone can fund to act as counterparty and earn yield.
+- **Controlled Warmup:** Starts with up to **10x** leverage (configurable up to 40x) with a 10-minute warmup while oracle history establishes.
 
-All defaults live in [`contracts/script/Defaults.sol`](contracts/script/Defaults.sol) and can be tuned by the protocol owner. The listing code is `PerpesEngine.listMarket` in [`contracts/src/PerpesEngine.sol`](contracts/src/PerpesEngine.sol), with tests in [`contracts/test/Listing.t.sol`](contracts/test/Listing.t.sol).
+### 2. Fair-Launch Perpetuals Launchpad (Primary Stage)
+For brand-new tokens, Priest.trade provides an end-to-end fair-launch system with instant leverage:
+- **Block-Zero Perpetual Trading:** New tokens launch directly with a perpetual futures market on a virtual AMM curve ($x \cdot y = k$).
+- **Zero Creator Pre-Mine:** 100% of the token supply is minted directly into the engine at creation.
+- **Up to 40x Leverage:** Initial 24-hour warmup capped at 10x leverage to prevent launch sniping, unlocking up to 40x as the market matures.
+- **Continuous EWMA Funding:** Funding rates adjust continuously based on open-interest skew and price divergence.
+
+### 3. Permanent Uniswap v4 Graduation (Secondary Stage)
+When a launchpad token proves authentic conviction by clearing **5 on-chain graduation gates** ($2M volume, 50 unique traders, funding stability, 7+ days resilience, fair-launch lock):
+- **Uniswap v4 Spot Seeding:** The engine automatically seeds a full-range Uniswap v4 spot liquidity pool using protocol collateral.
+- **Permanent LP Burn:** The Uniswap v4 LP position NFT is transferred directly to `0x000000000000000000000000000000000000dEaD`, permanently eliminating liquidity rug pulls.
+- **Supply Burn:** All remaining unminted token reserves are burned forever.
+- **Transition to Secondary Rail:** The perpetual market transitions seamlessly to the secondary oracle rail, trading against the newly seeded spot pool with worst-of fills and Counterflow vault backing.
+
+### 4. Counterflow LP Vault (`cfUSDC`)
+An automated ERC-4626 liquidity vault that serves as counterparty for secondary and listed markets:
+- Anyone can deposit USDC to back traders and earn **30% of platform trading fees** plus market surplus.
+- Risk-isolated per market with a **10% per-market exposure cap** and a **3-day withdrawal cooldown**.
 
 ---
 
 ## ⚡ Why Monad?
 
 Priest.trade is engineered from the ground up for Monad's architecture:
-- **10,000 TPS & 1-Second Block Times:** Sub-second trade execution, responsive funding adjustments, and prompt liquidations.
+- **10,000 TPS & 1-Second Block Times:** Sub-second trade execution, responsive funding rate adjustments, and prompt liquidations.
 - **Asynchronous Execution & MonadDb:** High-performance disk state access allows continuous EWMA funding index accumulation without state bottlenecks.
 - **Sub-Cent Gas Fees:** Micro-adjustments (like on-chain TP/SL repositioning and partial fills) are economically practical.
 
@@ -42,42 +59,60 @@ Priest.trade is engineered from the ground up for Monad's architecture:
 
 ## 📐 Architecture
 
-### Main path: list any Monad token
-
 ```
-   Any ERC-20 on Monad with a Uniswap v3 / v4 pool (>= $25k depth)
-                          │
-                          │  engine.listMarket(token, params)   (anyone, one transaction)
-                          ▼
-   [ Perp market opens ]
-   • Price from the token's own Uniswap pool (v4 EMA / v3 TWAP)
-   • Fills at the worse of oracle and pool price
-   • Premium for open-interest skew + 10 bps spread
-   • Lister earns the creator share of fees
-                          │
-                          ▼
-   [ Counterflow vault for that market ]
-   • ERC-4626 (cfUSDC), open to any depositor
-   • Isolated per market, backs traders' profits
+                                 PRIEST.TRADE
+                                      │
+              ┌───────────────────────┴───────────────────────┐
+              ▼                                               ▼
+   [ LIST EXISTING TOKEN ]                         [ LAUNCH NEW TOKEN ]
+   • Any Monad ERC-20 token                        • 100% supply minted to engine
+   • Requires Uniswap v3/v4 pool (>= $25k)         • Zero creator pre-mine
+   • Calls listMarket() permissionlessly           • Instant perp market from block zero
+   • Lister earns creator fee share                • Primary Stage: virtual curve (vAMM)
+              │                                    • Up to 40x leverage (10x warmup)
+              │                                               │
+              │                                               │ Clears 5 Gates:
+              │                                               │ $2M Vol, 50 Traders, Stability,
+              │                                               │ 7+ Days Age, Fair-Launch Lock
+              │                                               ▼
+              │                                    [ UNISWAP v4 GRADUATION ]
+              │                                    • Seeds full-range Uniswap v4 pool
+              │                                    • LP NFT burned to 0x...dEaD
+              │                                    • Unminted tokens burned
+              │                                               │
+              └───────────────────────┬───────────────────────┘
+                                      ▼
+                        [ SECONDARY MARKET ENGINE ]
+                        • On-chain Uniswap v4 EMA / v3 TWAP
+                        • Worst-of execution pricing (slippage immunity)
+                        • Skew premium + 10 bps spread
+                        • Backed by Counterflow LP Vault (cfUSDC)
 ```
 
 ---
 
-## 🚀 Secondary Feature: The Launchpad
+## 🚀 Launchpad Mechanics (Primary & Secondary Stages)
 
-For tokens that don't exist yet, Priest.trade can also launch one. The new token has a perp market from its first block, and it moves through two stages:
+### Primary Stage: Virtual AMM ($x \cdot y = k$)
+New tokens launched through Priest.trade start on the **Primary Engine**:
+- **Virtual Reserves:** Pricing is driven by virtual liquidity reserves ($x \cdot y = k$), providing deep liquidity from the very first dollar deposited.
+- **Warmup Protection:** Maximum leverage is capped at 10x for the first 24 hours to prevent flash-loan attacks and launch sniping, expanding to 40x as liquidity deepens.
+- **EWMA Funding Rate:** Longs pay shorts when market price exceeds the index price, and vice versa, balancing open interest.
 
-1. **Primary stage (virtual curve):** 100% of supply is minted to the engine with no creator pre-mine. Trading runs against a virtual AMM curve, with up to 40x leverage after a 24-hour warmup at 10x.
-2. **Secondary stage (Uniswap graduation):** Once a market clears the graduation gates ($2M volume, 50 traders, stable funding, 7+ days of resilience, fair-launch lock), the engine seeds a full-range **Uniswap v4** pool and sends the LP position NFT to `0x...dEaD`, so the liquidity can never be pulled. Unminted supply is burned, and the market then runs on the same oracle-priced engine as every listed token.
+### The 5 Graduation Gates
+To graduate into a permanent Uniswap spot pool, a primary market must clear five verifiable on-chain criteria:
+1. **Volume Threshold:** Cumulative perpetual trading volume $\ge \$2,000,000$.
+2. **Trader Diversity:** At least 50 unique non-Sybil trader wallets.
+3. **Funding Rate Stability:** Funding rate remains within normal bounds over a multi-day observation window.
+4. **Time & Resilience:** Minimum 7 days of active trading history to prove sustained interest.
+5. **Fair-Launch Security Lock:** All fair-launch criteria and collateral checks verified.
 
-```
-   [ Launch new token ]  →  [ Primary: virtual curve ]  →  5 graduation gates
-                                                              │
-                                                              ▼
-                         [ Secondary: Uniswap v4 pool, LP burned, oracle pricing ]
-```
-
-A graduated launchpad market is functionally the same as a listed one, which is why listing is the main path and the launchpad is an optional on-ramp.
+### Secondary Stage: Uniswap v4 & Permanent LP Burn
+Upon graduation:
+1. The engine deploys accumulated protocol USDC and base tokens to seed a full-range **Uniswap v4** pool.
+2. The Uniswap v4 position NFT is permanently burned by transferring it to `0x000000000000000000000000000000000000dEaD`.
+3. All remaining unminted token reserves are burned.
+4. The market switches from the vAMM curve to the **Secondary Rail**, executing against real spot pool TWAPs with worst-of fills and Counterflow vault backing.
 
 ---
 
@@ -111,18 +146,18 @@ A graduated launchpad market is functionally the same as a listed one, which is 
 The core engine was subjected to an extensive internal security review and static analysis (documented in [`contracts/AUDIT.md`](contracts/AUDIT.md)):
 
 - **H-1 Resolved (Carried Funding Debt):** Unpaid funding exceeding collateral is carried on-chain rather than forgiven, preventing unbacked credits.
-- **M-1 Resolved (Vault Headroom Caps):** Payouts and collateral withdrawals are strictly bounded by $\\text{Vault} - (\\text{Insurance} + \\text{Unclaimed Fees})$, ensuring reserved funds can never be withdrawn by winning trades.
+- **M-1 Resolved (Vault Headroom Caps):** Payouts and collateral withdrawals are strictly bounded by $\text{Vault} - (\text{Insurance} + \text{Unclaimed Fees})$, ensuring reserved funds can never be withdrawn by winning trades.
 - **M-2 Resolved (Blacklist Resilience):** Implemented `_payOrDefer` to ensure blacklisted addresses cannot block keeper liquidations or trigger stops.
 - **M-3 Resolved (Emergency Pause):** `setTradingPaused` freezes new opens and limit placements while **always permitting position closes and margin withdrawals**.
 - **Solvency Invariant:** Rigorously asserted in Foundry fuzzing tests:
-  $$\\text{Engine USDC Balance} = \\sum(\\text{VaultBalance} + \\text{OrderEscrow})$$
+  $$\text{Engine USDC Balance} = \sum(\text{VaultBalance} + \text{OrderEscrow})$$
 
 ---
 
 ## 📦 Repository Structure
 
 - **`contracts/`**: Complete Solidity smart contracts, Foundry scripts, and test suite.
-  - `src/PerpesEngine.sol`: The core perpetuals engine, vAMM, and secondary orchestrator.
+  - `src/PerpesEngine.sol`: The core perpetuals engine, vAMM, permissionless listing, and secondary orchestrator.
   - `src/CounterflowVault.sol`: The ERC-4626 `cfUSDC` LP vault.
   - `src/PerpesToken.sol`: Fair-launch ERC-20 token contract.
   - `src/PerpesOracle.sol` & `PerpesSecondaryMath.sol`: On-chain oracle & worst-of fill math.
