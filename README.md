@@ -210,7 +210,7 @@ The core engine was subjected to an extensive internal security review and stati
   - `packages/types/`: Shared TypeScript models.
   - `packages/offchain/`: Shared logging, PostgreSQL pool, and Redis utilities.
   - `packages/config/`: Monorepo configurations (ESLint, Prettier, tsconfig).
-- **`docs/`**: Complete GitBook documentation covering getting started, core concepts, trading, launchpad, vaults, rewards, and API.
+- **`docs/`**: Complete Mintlify documentation suite (`docs.json`, `mint.json`, interactive MDX components, and KaTeX math) covering getting started, core concepts, trading, launchpad, vaults, rewards, and API.
 
 ---
 
@@ -244,6 +244,12 @@ pnpm build
 cd mobile
 pnpm install
 pnpm start
+```
+
+### 5. Preview Documentation (Mintlify)
+```bash
+cd docs
+npx mintlify dev
 ```
 
 ---

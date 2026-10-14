@@ -1,0 +1,47 @@
+---
+title: "Troubleshooting"
+description: "Common issues and solutions when interacting with Priest.trade on Monad."
+icon: "wrench"
+---
+
+Common issues and solutions when interacting with Priest.trade on Monad.
+
+---
+
+## 1. Transaction Errors
+
+### Error: `LeverageTooHigh()`
+- **Cause:** Your chosen position notional divided by collateral exceeds the market's current maximum leverage cap.
+- **Solution:** Reduce your leverage multiplier or add more collateral. Note that markets in their first 24-hour **Warmup** phase are capped at **10x**.
+
+### Error: `SlippageExceeded()` / `PriceImpactTooHigh()`
+- **Cause:** Market prices moved beyond your slippage limit between order creation and block inclusion, or your order size is large relative to current virtual depth.
+- **Solution:** Increase your slippage tolerance slightly in trade settings (e.g. from 1.0% to 2.0%) or split your order into smaller chunks.
+
+### Error: `InsufficientCollateral()` / `InsufficientVaultHeadroom()`
+- **Cause:** Attempting to withdraw collateral that would breach initial margin requirements, or attempting a withdrawal that exceeds available unreserved vault headroom.
+- **Solution:** Keep sufficient margin in your position to maintain your health ratio, or wait for pending profits to settle.
+
+### Error: `PendingLiquidation()`
+- **Cause:** The position is already flagged for liquidation because its margin ratio fell below the maintenance margin threshold.
+- **Solution:** Once flagged, positions cannot take on new collateral. Manage risk early by setting Stop Loss triggers before maintenance margin is breached.
+
+---
+
+## 2. Wallet & Connection Issues
+
+### Wallet Doesn't Prompt on Monad
+- **Cause:** Conflicting browser extensions (e.g. MetaMask and Phantom both competing for `window.ethereum`).
+- **Solution:** Set Rabby or MetaMask as your default provider, or connect via Privy's embedded login. Ensure network is set to Chain ID `143` (Mainnet) or `10143` (Testnet).
+
+### Stuck Pending Transaction / Nonce Desync
+- **Cause:** Network congestion or a dropped transaction with an outdated nonce.
+- **Solution:** In MetaMask, go to **Settings > Advanced > Clear activity tab data** to reset the nonce cache. Monad's 1-second blocks clear transactions rapidly once properly broadcast.
+
+---
+
+## 3. Position & Balance Display Issues
+
+### Balances Not Updating Instantly
+- **Cause:** Local browser RPC cache.
+- **Solution:** Click the refresh icon in the upper-right corner next to your wallet address or hard refresh your browser (`Ctrl+Shift+R` or `Cmd+Shift+R`).

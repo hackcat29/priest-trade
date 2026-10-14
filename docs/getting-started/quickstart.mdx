@@ -1,0 +1,90 @@
+---
+title: "Quickstart"
+description: "Get trading on Priest.trade in less than 5 minutes. This walkthrough guides you through connecting your wallet, acquiring test or mainnet..."
+icon: "bolt"
+---
+
+Get trading on Priest.trade in less than 5 minutes. This walkthrough guides you through connecting your wallet, acquiring test or mainnet funds, placing your first leveraged position, and managing it.
+
+---
+
+## Step 1: Connect your wallet
+
+1. Open [priest.trade](https://priest.trade) in your browser.
+2. Click **Connect Wallet** in the top-right corner.
+3. Choose your preferred connection method:
+   - **Privy Embedded Wallet:** Sign in seamlessly with your email, Google, Twitter, or passkey. Privy automatically provisions a non-custodial EVM wallet.
+   - **External EVM Wallet:** Connect Rabby, MetaMask, Phantom (EVM), Coinbase Wallet, or any injected EVM provider.
+4. Ensure your wallet is connected to the **Monad** network (Chain ID: `143` for mainnet, `10143` for testnet). The app will prompt you to switch if needed.
+
+<Note>
+For detailed wallet troubleshooting, see [Connecting Your Wallet](/getting-started/connecting-your-wallet).
+</Note>
+
+---
+
+## Step 2: Acquire MON and USDC
+
+To trade on Priest.trade, you need two assets:
+- **MON:** The native gas token of Monad, used to pay network fees (fractions of a cent per transaction).
+- **USDC:** Native Circle USDC on Monad (`0x754704Bc059F8C67012fEd69BC8A327a5aafb603`), used as margin collateral for all perpetuals positions.
+
+### On Monad Testnet
+If you are testing on Monad Testnet:
+1. Obtain testnet MON from the official Monad Testnet faucet.
+2. In the Priest.trade app header, click **Faucet** to mint MockUSDC straight to your wallet.
+
+### On Monad Mainnet
+Bridge or transfer native USDC and MON to your Monad address using official ecosystem bridges.
+
+---
+
+## Step 3: Select a market
+
+Navigate to the **Trade** tab or browse the **Markets** discovery page:
+- **Warmup Markets:** Newly launched tokens within their first 24 hours (leverage capped at 10x for safety).
+- **Active vAMM Markets:** Primary-rail tokens with mature volume (leverage up to 40x).
+- **Graduated Markets:** Tokens that have graduated to Uniswap v4 spot liquidity and the secondary oracle engine.
+- **Listed Markets:** Community-listed tokens trading off Uniswap v3/v4 pools.
+
+Click any market row to load the trading terminal, live candlestick chart, and order form.
+
+---
+
+## Step 4: Place your first trade
+
+1. On the right-hand order panel, select your trade direction:
+   - **Long (Green):** You profit if the token price rises.
+   - **Short (Red):** You profit if the token price falls.
+2. Choose your order type:
+   - **Market:** Fills immediately against the vAMM or secondary engine.
+   - **Limit:** Sets a specific target entry price.
+3. Enter your **Margin Collateral** in USDC (e.g. 50 USDC).
+4. Adjust the **Leverage Slider** (e.g. 5x).
+   - Your **Position Size** (Notional) will automatically calculate: $\text{Notional} = \text{Collateral} \times \text{Leverage}$ (e.g. $50 \times 5 = 250\text{ USDC}$).
+5. Review your estimated entry price, price impact / slippage, trading fee (0.10%), and liquidation price.
+6. Click **Approve USDC** (one-time approval) and then **Open Long** or **Open Short**.
+7. Confirm the transaction in your wallet. Thanks to Monad's 1-second block times, your order will confirm almost instantly!
+
+---
+
+## Step 5: Manage your position
+
+Once your order confirms, your live trade will appear in the **Positions** table beneath the chart:
+
+- **Entry Price:** Your execution price.
+- **Mark Price:** Current mark price of the contract.
+- **Unrealized PnL:** Real-time dollar and percentage profit or loss.
+- **Liquidation Price:** The price at which your position becomes eligible for liquidation. Keep your collateral healthy to avoid liquidation!
+- **Add / Remove Collateral:** Click the `+` or `-` buttons next to your margin to increase your buffer or withdraw excess profits.
+- **Set TP / SL:** Click **Set TP/SL** to configure automated on-chain Take Profit and Stop Loss triggers.
+- **Close Position:** Click **Market Close** or **Limit Close** to exit your position and return your margin plus realized profit to your wallet.
+
+---
+
+## What's next?
+
+- Learn more about the mechanics in **[Order Types](/trading/order-types)**.
+- Understand the complete fee structure in **[Fees](/trading/fees)**.
+- Explore how to launch your own token in **[Launching a Token](/launching-tokens/launching-a-token)**.
+- Earn passive yield on your USDC in **[Counterflow Vault](/vaults/counterflow-vault)**.

@@ -1,0 +1,34 @@
+---
+title: "Wallet Security"
+description: "Maintaining robust personal operational security (OpSec) is your primary defense when interacting with decentralized applications on Monad."
+icon: "key"
+---
+
+Maintaining robust personal operational security (OpSec) is your primary defense when interacting with decentralized applications on Monad.
+
+---
+
+## 1. Protecting Your Private Keys & Seed Phrases
+
+- **Never Share Seed Phrases:** No member of the Priest.trade team will ever ask you for your private key, seed phrase, or password. Anyone asking for these credentials is an attacker.
+- **Privy Embedded Wallets:** If using social/email login with Privy, protect your underlying email and social accounts with strong unique passwords and Hardware Security Keys (YubiKey) or Authenticator App 2FA (avoid SMS 2FA).
+- **Key Export Safety:** If exporting your private key from Privy to an external extension like Rabby or MetaMask, do so on a private, malware-free machine.
+
+---
+
+## 2. Token Approval Hygiene
+
+When trading or using Counterflow:
+- You will approve the `PerpesEngine` or `CounterflowVault` contract to transfer your USDC.
+- **Verify Contract Addresses:** Always check that the contract you are approving matches the official deployments listed in [Contract Deployments](/developers/deployments).
+- **Revoke Allowances:** If taking an extended break from trading, use tools like Revoke.cash on Monad to reset unused token approvals to zero.
+
+---
+
+## 3. Phishing & Domain Verification
+
+- **Official Domain:** Always verify that the URL in your browser address bar is exactly:
+  `https://priest.trade`
+- Beware of phishing domains with subtle typos (e.g. `prlest.trade`, `priest-trade.com`).
+- Bookmark the official site and access it exclusively through your bookmarks.
+- Never click unverified direct links sent to you in Telegram or Discord direct messages (DMs).

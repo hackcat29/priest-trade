@@ -1,0 +1,52 @@
+---
+title: "Insurance Fund"
+description: "The insurance fund is an on-chain safety reserve. Its job is to absorb losses when a liquidated position falls below zero equity before i..."
+icon: "shield-halved"
+---
+
+The insurance fund is an on-chain safety reserve. Its job is to absorb losses when a liquidated position falls below zero equity before it can be closed.
+
+---
+
+## Isolated per market
+
+Instead of one giant pool where an exploit on a micro-cap coin could drain funds from everyone else, Priest.trade keeps **a separate insurance reserve for each individual market**.
+
+- What happens in one meme coin market stays in that market.
+- Big, liquid markets build up their own independent safety nets.
+- You can inspect any market's insurance balance on-chain at any time.
+
+---
+
+## Where the money comes from
+
+A market's insurance reserve grows in three ways:
+
+1. **10% of all trade fees:** Every time someone opens or closes a trade on that coin, 10% of the platform fee goes directly into that market's insurance reserve.
+2. **Liquidation penalties:** When a position is liquidated with equity left over, a portion of the remainder goes into the reserve.
+3. **Pre-graduation pool corrections:** If someone tries to mess with the Uniswap pool price right before graduation, the engine's rebalancing swap extracts the difference and sends it to the insurance reserve.
+
+---
+
+## When it gets used
+
+If a market moves so fast that a trader's position gets liquidated at a price worse than zero equity (bad debt):
+
+1. The market's insurance reserve pays the shortfall.
+2. If the insurance reserve is emptied on a graduated market, the **Counterflow Vault** steps in to cover the rest.
+3. Solvent traders never take haircuts or auto-deleveraging under normal conditions.
+
+---
+
+## Headroom cap
+
+The contract guarantees that insurance money cannot be drained by ordinary payouts:
+- You can only withdraw collateral or claim trading profits from surplus headroom — never from funds tagged for insurance or unpaid creator fees.
+
+---
+
+## See also
+
+- [Liquidations](/core-concepts/liquidations) — when insurance steps in.
+- [Counterflow Overview](/vaults/counterflow-vault) — the secondary liquidity backstop.
+- [Fees](/trading/fees) — where trading fees go.

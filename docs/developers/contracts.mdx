@@ -1,0 +1,77 @@
+---
+title: "Contracts & Architecture"
+description: "The Priest.trade on-chain architecture is engineered in Solidity (^0.8.28) specifically for the high-throughput Monad EVM."
+icon: "file-code"
+---
+
+The Priest.trade on-chain architecture is engineered in Solidity (^0.8.28) specifically for the high-throughput Monad EVM.
+
+---
+
+## 1. System Architecture Map
+
+```
+                             ┌────────────────────────┐
+                             │      User / Trader     │
+                             └───────────┬────────────┘
+                                         │
+                        USDC Transfers   │  Calls Engine
+                                         ▼
+ ┌──────────────────┐            ┌────────────────────────┐
+ │   Circle USDC    │◄───────────┤    PerpesEngine.sol    │
+ │   (ERC-20, 6 dec)│            │      (UUPS Proxy)      │
+ └──────────────────┘            └───────────┬────────────┘
+                                             │
+             ┌───────────────────────────────┼───────────────────────────────┐
+             ▼                               ▼                               ▼
+ ┌──────────────────────┐        ┌──────────────────────┐        ┌──────────────────────┐
+ │  CounterflowVault    │        │  Uniswap v4 Manager  │        │   PerpesToken.sol    │
+ │  (ERC-4626, cfUSDC)  │        │  (Graduation Pool)   │        │  (Launched Tokens)   │
+ └──────────────────────┘        └──────────────────────┘        └──────────────────────┘
+```
+
+---
+
+## 2. Core Smart Contracts
+
+### `PerpesEngine.sol`
+The central protocol contract. It manages all perpetuals markets, accounts for per-market USDC vaults, executes vAMM and secondary orders, enforces liquidations, tracks limit orders, and manages graduations.
+- **Proxy Pattern:** UUPS Upgradeable (`Initializable`, `UUPSUpgradeable`, `Ownable2StepUpgradeable`, `ReentrancyGuardUpgradeable`).
+- **Storage Isolation:** Each market's deposited collateral, insurance funds, and fees are accounted for in its own `Market` struct:
+  $$\text{Engine USDC Balance} = \sum(\text{vaultBalanceUsdc} + \text{orderEscrowUsdc})$$
+- **Key Methods:**
+  - `createTokenAndMarket(LaunchParams p)`
+  - `listMarket(address token, ListingParams p)`
+  - `openPosition(address token, Side side, uint256 collateral, uint256 notional, uint16 maxSlippage)`
+  - `closePosition(address token, uint256 closeNotional, uint16 maxSlippage)`
+  - `addCollateral(address token, uint256 amount)`
+  - `removeCollateral(address token, uint256 amount)`
+  - `liquidate(address token, address owner)`
+  - `placeLimitOrder(address token, Side side, OrderType orderType, uint256 priceE6, uint256 collateral, uint256 notional)`
+  - `cancelLimitOrder(uint256 orderId)`
+  - `setTriggers(address token, uint256 takeProfitPriceE6, uint256 stopLossPriceE6)`
+  - `executeTrigger(address token, address owner)`
+  - `claimCreatorFees(address token)`
+  - `claimProtocolFees(address token)`
+  - `graduate(address token, uint256 seedUsdc, uint256 minPriceE6, uint256 maxPriceE6)`
+  - `syncCounterflow(address token)`
+
+### `CounterflowVault.sol`
+The automated liquidity provider vault (`cfUSDC`).
+- **Standard:** ERC-4626 tokenized vault over Circle USDC.
+- **Role:** Backs secondary and graduated markets. When a market vault has a deficit paying out winners, Counterflow pays via `cover()`. Counterflow receives 30% of protocol fees and all market surplus via `onIncome()`.
+- **Key Methods:**
+  - `deposit(uint256 assets, address receiver)`
+  - `requestRedeem(uint256 shares)`: Initiates 3-day cooldown.
+  - `cancelRedeem(uint256 id)`: Cancels pending request.
+  - `claimRedeem(uint256 id)`: Burns shares and withdraws assets post-cooldown.
+  - `totalAssets()`: Computes conservative cash-based NAV.
+
+### `PerpesToken.sol`
+The standardized ERC-20 contract deployed for every newly launched token.
+- **Fixed Supply:** 1,000,000,000 tokens (18 decimals).
+- **Minting:** 100% minted to `PerpesEngine` at deployment; mint authority revoked permanently.
+- **Immutable:** No freeze, pause, or blacklist capabilities.
+
+### `PerpesOracle.sol` & `PerpesSecondaryMath.sol`
+Mathematical libraries that compute on-chain Uniswap v3 TWAP (`observe`), Uniswap v4 EMA, and worst-of pricing formulas.

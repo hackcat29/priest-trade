@@ -1,0 +1,54 @@
+---
+title: "NAV, Yield & Profit Unlocking"
+description: "Accounting in CounterflowVault.sol is designed to be cash-based, conservative, and resistant to front-running."
+icon: "chart-line"
+---
+
+Accounting in `CounterflowVault.sol` is designed to be cash-based, conservative, and resistant to front-running.
+
+---
+
+## 1. Conservative NAV Calculation
+
+In standard DeFi vaults, Net Asset Value (NAV) often counts paper profits or projected debt as assets, leading to inaccurate valuations when markets turn.
+
+Counterflow enforces **Cash-Based NAV Accounting**:
+
+$$\text{NAV} = \text{totalAssets()} = \text{Cash} - \text{Locked Profit}$$
+
+Where:
+- **Cash:** The actual physical USDC balance held by the `CounterflowVault` contract (`IERC20(usdc).balanceOf(address(this))`).
+- **Locked Profit:** Newly swept income that has not yet unlocked over the 1-day vesting period.
+- **Unpaid Covers:** When Counterflow covers a market deficit, that capital is written off as an immediate realized loss the moment it leaves the vault. What the engine owes back is **not counted** as an asset until it physically arrives.
+
+---
+
+## 2. The 1-Day Linear Profit Unlock
+
+When a market sweeps trading fees or trader losses into Counterflow via `syncCounterflow()`, that income does not immediately boost the share price in a single block.
+
+### Why Profit Unlocking?
+If a large surplus sweep immediately bumped the share price by 5%, an MEV searcher could deposit right before the sweep transaction and withdraw right after, diluting existing LPs.
+
+### The Linear Unlocking Mechanism:
+- When income arrives, it is added to `lockedProfit`.
+- The profit unlocks smoothly and linearly over **24 hours** (`profitUnlockSeconds = 86,400\text{ seconds}`).
+- Every second, a fraction of that profit vests permanently into NAV:
+  $$\text{Current Locked Profit} = \frac{\text{Locked Profit} \times (\text{Unlock Window} - \text{Elapsed})}{\text{Unlock Window}}$$
+- Existing long-term depositors capture 100% of the yield smoothly.
+
+---
+
+## 3. Revenue Sources & Fee Streams
+
+Counterflow generates yield through two continuous mechanisms:
+
+### A. 30% Protocol Fee Share
+Every trade executed on a Counterflow-backed market pays a 0.10% fee. Exactly **30% of the protocol's fee cut** is automatically routed to Counterflow. As long as trading occurs on Monad, Counterflow earns passive cash flow.
+
+### B. Trader Net Losses (Surplus Sweeps)
+Perpetuals markets are naturally zero-sum before fees. When traders lose on a backed market, the market collateral vault accumulates a cash surplus beyond what is needed to back existing open interest:
+$$\text{Surplus} = \text{Vault} - \text{Reserved} - \text{Collateral} - \text{Buffer (10%)} - \text{Positive PnL}$$
+Anyone can permissionlessly call `syncCounterflow(token)` on the engine. The surplus is transferred directly to the vault:
+- It **repays past covers** first.
+- The remainder becomes net profit that begins unlocking over 24 hours.

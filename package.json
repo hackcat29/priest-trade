@@ -10,7 +10,8 @@
     "lint": "turbo run lint",
     "contracts:build": "cd contracts && forge build",
     "contracts:test": "cd contracts && forge test",
-    "contracts:install": "cd contracts && ./install-deps.sh"
+    "contracts:install": "cd contracts && ./install-deps.sh",
+    "docs:dev": "cd docs && npx mintlify dev"
   },
   "devDependencies": {
     "prettier": "^3.3.3",

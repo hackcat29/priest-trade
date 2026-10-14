@@ -1,0 +1,167 @@
+---
+title: "TypeScript & Viem SDK"
+description: "Integrating Priest.trade into trading algorithms, keeper bots, and arbitrage scripts on Monad using TypeScript and viem."
+icon: "code"
+---
+
+Integrating Priest.trade into trading algorithms, keeper bots, and arbitrage scripts on Monad using TypeScript and `viem`.
+
+---
+
+## 1. Installation
+
+Install `viem` along with Priest.trade packages:
+
+```bash
+npm install viem @perpes/evm
+# or
+pnpm add viem @perpes/evm
+```
+
+---
+
+## 2. Setting Up the Client
+
+```typescript
+import { createPublicClient, createWalletClient, http } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { monadMainnet, perpesEngineAbi, getEvmDeployment, toE6 } from '@perpes/evm';
+
+const deployment = getEvmDeployment('monad')!;
+
+const account = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
+
+const publicClient = createPublicClient({
+  chain: monadMainnet,
+  transport: http(),
+});
+
+const walletClient = createWalletClient({
+  account,
+  chain: monadMainnet,
+  transport: http(),
+});
+```
+
+---
+
+## 3. Querying Market State
+
+```typescript
+// Fetch real-time market data
+const market = await publicClient.readContract({
+  address: deployment.engine,
+  abi: perpesEngineAbi,
+  functionName: 'getMarket',
+  args: [tokenAddress],
+});
+
+console.log('Status:', market.status);
+console.log('Index Price (USD):', Number(market.indexPriceE6) / 1e6);
+console.log('Max Leverage:', market.maxLeverageX);
+```
+
+---
+
+## 4. Opening a Leveraged Position
+
+```typescript
+import { erc20Abi } from 'viem';
+
+const tokenAddress = '0x1234...'; // The token perp to trade
+const collateral = toE6(100);     // 100 USDC margin
+const notional = toE6(1000);      // 1,000 USDC position size (10x leverage)
+const maxSlippageBps = 100;       // 1.0% slippage
+
+// 1. Approve USDC to the engine
+const approveHash = await walletClient.writeContract({
+  address: deployment.usdc,
+  abi: erc20Abi,
+  functionName: 'approve',
+  args: [deployment.engine, collateral + toE6(1)], // include fee buffer
+});
+await publicClient.waitForTransactionReceipt({ hash: approveHash });
+
+// 2. Open Long (Side.Long = 0, Side.Short = 1)
+const txHash = await walletClient.writeContract({
+  address: deployment.engine,
+  abi: perpesEngineAbi,
+  functionName: 'openPosition',
+  args: [
+    tokenAddress,
+    0, // 0 = Long, 1 = Short
+    collateral,
+    notional,
+    maxSlippageBps,
+  ],
+});
+
+console.log('Position opened in tx:', txHash);
+```
+
+---
+
+## 5. Setting On-Chain TP / SL Triggers
+
+```typescript
+// Target Take Profit at $1.50 and Stop Loss at $0.85
+const takeProfitE6 = toE6(1.50);
+const stopLossE6 = toE6(0.85);
+
+const txHash = await walletClient.writeContract({
+  address: deployment.engine,
+  abi: perpesEngineAbi,
+  functionName: 'setTriggers',
+  args: [tokenAddress, takeProfitE6, stopLossE6],
+});
+
+console.log('Triggers set in tx:', txHash);
+```
+
+---
+
+## 6. Closing a Position
+
+```typescript
+// Close 100% of notional
+const closeTx = await walletClient.writeContract({
+  address: deployment.engine,
+  abi: perpesEngineAbi,
+  functionName: 'closePosition',
+  args: [
+    tokenAddress,
+    notional, // specify full notional to exit completely
+    maxSlippageBps,
+  ],
+});
+
+console.log('Position closed in tx:', closeTx);
+```
+
+---
+
+## 7. Depositing into Counterflow Vault
+
+```typescript
+import { counterflowVaultAbi } from '@perpes/evm';
+
+const depositAmount = toE6(500); // 500 USDC
+
+// 1. Approve USDC to Counterflow
+await walletClient.writeContract({
+  address: deployment.usdc,
+  abi: erc20Abi,
+  functionName: 'approve',
+  args: [deployment.counterflowVault!, depositAmount],
+});
+
+// 2. Deposit USDC for cfUSDC shares
+const depositTx = await walletClient.writeContract({
+  address: deployment.counterflowVault!,
+  abi: counterflowVaultAbi,
+  functionName: 'deposit',
+  args: [depositAmount, account.address],
+});
+
+console.log('Deposited to Counterflow:', depositTx);
+```

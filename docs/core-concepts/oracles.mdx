@@ -1,0 +1,51 @@
+---
+title: "Oracle & Reference Pricing"
+description: "Every perpetual market needs a reference price to calculate funding rates and decide when a position is up for liquidation. Here is how P..."
+icon: "eye"
+---
+
+Every perpetual market needs a reference price to calculate funding rates and decide when a position is up for liquidation. Here is how Priest.trade gets its prices on-chain.
+
+---
+
+## 1. Primary markets (vAMM)
+
+When a coin first launches, there is no external spot pool yet. The engine calculates two internal prices:
+
+- **Mark Price:** The current instantaneous price calculated directly from the virtual curve ($x \cdot y = k$). Fills happen here.
+- **Index Price:** An on-chain Exponential Weighted Moving Average (EWMA) of recent fills. This filters out single-trade wicks and is used to compute funding rates and liquidation triggers.
+
+---
+
+## 2. Secondary markets (Uniswap v4 & v3)
+
+Once a market graduates or an existing coin is listed, it references real spot pools on Monad:
+
+- **Uniswap v4 (graduated coins):** The engine tracks a smoothed moving average of the pool price. Samples are taken once per second and clamped so sudden spikes can't spoof the price.
+- **Uniswap v3 (listed coins):** Uses Uniswap's built-in 5-minute time-weighted average (TWAP).
+- **MON pairs:** If a coin is paired with WMON instead of USDC, the price converts to USD using the main WMON/USDC pool TWAP.
+
+---
+
+## 3. "Worst-of" fill protection
+
+To make sure traders can't exploit small delays between a fast spot swap and a slower moving average, executions use **worst-of pricing**:
+
+- **Buying (Long):** Fills at whichever is higher between the live spot price and the oracle average.
+- **Selling (Short):** Fills at whichever is lower between the live spot price and the oracle average.
+
+This stops people from buying at an artificially low lagging price when the spot pool is already pumping, or shorting at a high lagging price when the pool is dumping.
+
+---
+
+## 4. Liquidations stay on the oracle
+
+While fills use the worst-of rule, **liquidations rely on the smoothed oracle average**. If someone manipulates the spot pool for a single block, your position will not be liquidated. The smoothed average ignores the wick, protecting honest traders.
+
+---
+
+## See also
+
+- [The Secondary Market Engine](/core-concepts/secondary-market-engine) — how secondary trading works.
+- [Circuit Breakers](/core-concepts/circuit-breakers) — what happens when oracles go stale.
+- [Liquidations](/core-concepts/liquidations) — how oracle checks protect positions.

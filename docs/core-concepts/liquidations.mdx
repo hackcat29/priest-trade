@@ -1,0 +1,56 @@
+---
+title: "Liquidations"
+description: "A liquidation happens when a position runs out of margin. If your losses get too close to your deposited collateral, the protocol closes ..."
+icon: "skull-crossbones"
+---
+
+A liquidation happens when a position runs out of margin. If your losses get too close to your deposited collateral, the protocol closes your trade to prevent you from going into negative balance.
+
+---
+
+## When does liquidation happen?
+
+Your position gets liquidated when your **Margin Ratio** drops below the **Maintenance Margin** requirement:
+
+- At **40x leverage**, your maintenance margin is **1.25%**.
+- That means if your remaining equity (collateral plus unrealized PnL minus owed funding) drops to 1.25% of your position's total value, your position is liquidated.
+
+---
+
+## Protection against wick liquidations
+
+On volatile meme coins, sudden flash wicks on one exchange or pool can wipe people out unfairly.
+
+Priest.trade uses a **dual-price check** to stop this:
+- Your position is only liquidated if your margin ratio is breached at **both the mark price AND the index price** (the smoothed moving average).
+- If someone pumps or dumps the price for a single block, the smoothed index barely moves, and the liquidation transaction reverts. You stay in your trade.
+
+---
+
+## What happens during a liquidation
+
+When a position is liquidated:
+
+1. The position is closed at the market price through the curve or secondary engine.
+2. Any remaining equity is split:
+   - A trading fee is deducted.
+   - A small reward goes to the keeper bot that executed the liquidation.
+   - A penalty goes to the market's insurance fund.
+   - Whatever is left over goes back to your wallet.
+3. If the position closed with negative equity (a gap down past zero), the market's insurance fund absorbs the loss.
+
+---
+
+## How to avoid getting liquidated
+
+- **Use Stop Losses:** Set an automatic stop loss on your trade so you exit before reaching maintenance margin.
+- **Add Margin:** If a trade is moving against you, click the `+` icon next to your position to add more USDC collateral. This moves your liquidation price farther away.
+- **Trade with Lower Leverage:** High leverage leaves almost no room for error. A 10x position gives you a ~9% buffer, while 40x gives you only ~1.25%.
+
+---
+
+## See also
+
+- [Leverage & Margin](/core-concepts/leverage-and-margin) — how margin requirements are calculated.
+- [Take Profit & Stop Loss](/trading/tp-sl-orders) — setting automated exits.
+- [Insurance Fund](/core-concepts/insurance-fund) — what covers bad debt.

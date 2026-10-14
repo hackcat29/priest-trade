@@ -1,0 +1,51 @@
+---
+title: "The Secondary Market Engine"
+description: "Once a market graduates — or when an existing Monad coin is listed — it moves off the internal virtual curve onto the secondary engine."
+icon: "bolt"
+---
+
+Once a market graduates — or when an existing Monad coin is listed — it moves off the internal virtual curve onto the **secondary engine**.
+
+Instead of trading against a standalone virtual pool, the perp now prices off real spot liquidity on Uniswap, backed by the **Counterflow Vault (`cfUSDC`)**.
+
+---
+
+## How pricing works
+
+On the secondary engine, fills are based on three things:
+
+### 1. The on-chain oracle
+- **Uniswap v4 pools (graduated markets):** The engine tracks a smoothed moving average of the pool price. Samples are taken once a second and capped so a single quick swap can't spike the oracle.
+- **Uniswap v3 pools (listed tokens):** Uses Uniswap's built-in 5-minute TWAP. If a token is paired with WMON, the price converts to USD using the main WMON/USDC pool.
+
+### 2. "Worst-of" fill protection
+To stop traders from front-running a lagging oracle or a moved spot pool, takers always fill at the **worse of the oracle price and the live pool price**:
+- **Longs (buys):** Fill at whichever price is higher.
+- **Shorts (sells):** Fill at whichever price is lower.
+
+This means you can't buy at an old low oracle price while the real pool is already higher, and you can't dump at a high oracle price while the real pool is lower.
+
+### 3. Skew premium and spread
+When a market gets lopsided (e.g. way more longs than shorts), the crowded side pays a small premium. The premium scales with the order size and is path-averaged, so splitting an order into small chunks costs the exact same as one big order. Every trade also includes a baseline 10 bps half-spread.
+
+---
+
+## Leverage and limits on secondary
+
+- **Opening leverage:** Starts at 15x on day one of graduation, then steps up by 5x each day until reaching 40x.
+- **Open interest caps:** Scaled directly to how much USDC depth the spot pool actually has.
+- **Single-wallet limit:** No single trader can hold more than 25% of the market's total capacity.
+
+---
+
+## Backed by Counterflow
+
+Graduated markets are backed by Counterflow, Priest's community liquidity vault. If a market runs into a temporary deficit paying out winning traders, Counterflow steps in to cover the difference. In exchange, Counterflow gets 30% of the market's trading fees and keeps the surplus when traders lose.
+
+---
+
+## See also
+
+- [Graduation into Uniswap v4](/launching-tokens/graduation) — how a market gets here.
+- [Counterflow Overview](/vaults/counterflow-vault) — how the backing vault works.
+- [Oracle & Reference Pricing](/core-concepts/oracles) — technical details on price feeds.

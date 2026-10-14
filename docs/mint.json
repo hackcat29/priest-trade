@@ -1,0 +1,136 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "Priest.trade",
+  "colors": {
+    "primary": "#836EF9",
+    "light": "#A78BFA",
+    "dark": "#6D28D9"
+  },
+  "favicon": "/favicon.png",
+  "navigation": [
+    {
+      "group": "Getting Started",
+      "pages": [
+        "index",
+        "getting-started/what-is-priest-trade",
+        "getting-started/quickstart",
+        "getting-started/connecting-your-wallet",
+        "getting-started/funding-your-account",
+        "getting-started/faucet-and-testnet",
+        "getting-started/supported-networks"
+      ]
+    },
+    {
+      "group": "Core Concepts",
+      "pages": [
+        "core-concepts/perpetual-futures",
+        "core-concepts/vamm-explained",
+        "core-concepts/secondary-market-engine",
+        "core-concepts/market-lifecycle",
+        "core-concepts/leverage-and-margin",
+        "core-concepts/funding-rates",
+        "core-concepts/liquidations",
+        "core-concepts/insurance-fund",
+        "core-concepts/circuit-breakers",
+        "core-concepts/oracles"
+      ]
+    },
+    {
+      "group": "Trading",
+      "pages": [
+        "trading/trading-terminal",
+        "trading/placing-orders",
+        "trading/order-types",
+        "trading/managing-positions",
+        "trading/tp-sl-orders",
+        "trading/reading-the-chart",
+        "trading/fees",
+        "trading/slippage-and-execution",
+        "trading/portfolio"
+      ]
+    },
+    {
+      "group": "Launching & Listing",
+      "pages": [
+        "launching-tokens/launchpad-overview",
+        "launching-tokens/launching-a-token",
+        "launching-tokens/listing-tokens",
+        "launching-tokens/fair-launch-protections",
+        "launching-tokens/creator-dashboard",
+        "launching-tokens/creator-earnings",
+        "launching-tokens/graduation"
+      ]
+    },
+    {
+      "group": "Counterflow LP Vault",
+      "pages": [
+        "vaults/counterflow-vault",
+        "vaults/depositing-and-withdrawing",
+        "vaults/nav-and-yield",
+        "vaults/risk-controls"
+      ]
+    },
+    {
+      "group": "Rewards & Referrals",
+      "pages": [
+        "rewards-and-referrals/rewards-overview",
+        "rewards-and-referrals/epochs-and-points",
+        "rewards-and-referrals/claiming-rewards",
+        "rewards-and-referrals/anti-wash-and-sybil",
+        "rewards-and-referrals/referrals",
+        "rewards-and-referrals/leaderboard"
+      ]
+    },
+    {
+      "group": "Social & Community",
+      "pages": [
+        "social/social-feed",
+        "social/livestreams",
+        "social/profiles",
+        "social/sharing-trades"
+      ]
+    },
+    {
+      "group": "Safety & Security",
+      "pages": [
+        "safety/risk-disclosure",
+        "safety/wallet-security",
+        "safety/known-risks",
+        "safety/glossary"
+      ]
+    },
+    {
+      "group": "Support",
+      "pages": [
+        "support/faq",
+        "support/troubleshooting",
+        "support/reporting-bugs",
+        "support/contact"
+      ]
+    },
+    {
+      "group": "Developers & Architecture",
+      "pages": [
+        "developers/api-overview",
+        "developers/websocket-api",
+        "developers/contracts",
+        "developers/deployments",
+        "developers/sdk"
+      ]
+    }
+  ],
+  "topbarLinks": [
+    {
+      "name": "Launch App",
+      "url": "https://priest.trade"
+    },
+    {
+      "name": "GitHub",
+      "url": "https://github.com/hackcat29/priest-trade"
+    }
+  ],
+  "topbarCtaButton": {
+    "name": "Trade on Monad",
+    "url": "https://priest.trade"
+  }
+}
