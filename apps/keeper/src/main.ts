@@ -30,6 +30,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createHealthServer, createLogger, createPgPool, queryRows, requireEnv } from '@perpes/offchain';
 import {
   EVM_CHAINS,
+  evmRpcUrl,
   getEvmDeployment,
   isEvmChainKey,
   mockUsdcAbi,
@@ -51,7 +52,7 @@ const deployment = getEvmDeployment(CHAIN, {
 if (!deployment) throw new Error(`No PerpesEngine deployment for ${CHAIN}; set EVM_ENGINE_ADDRESS`);
 const ENGINE = deployment.engine;
 
-const RPC_URL = process.env['EVM_RPC_URL'] || EVM_CHAINS[CHAIN].rpcUrls.default.http[0]!;
+const RPC_URL = evmRpcUrl(CHAIN, { rpcUrl: process.env['EVM_RPC_URL'], alchemyApiKey: process.env['ALCHEMY_API_KEY'] });
 const PORT = Number.parseInt(process.env['EVM_KEEPER_PORT'] ?? '3022', 10);
 const TICK_MS = Number.parseInt(process.env['EVM_KEEPER_TICK_MS'] ?? '2000', 10);
 const DRY_RUN = process.env['KEEPER_DRY_RUN'] === 'true';

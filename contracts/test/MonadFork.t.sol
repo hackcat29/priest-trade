@@ -24,6 +24,12 @@ contract MonadForkTest is Test {
     address constant WMON = 0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A;
     // Uniswap v3 WMON/USDC 0.3% — the MON/USD reference and the pool MON is listed on.
     address constant WMON_USDC_V3 = 0x659bD0BC4167BA25c62E05656F78043E7eD4a9da;
+    // Kuru (on-chain order book): the market factory and two of its USDC books.
+    address constant KURU_ROUTER = 0xd651346d7c789536ebf06dc72aE3C8502cd695CC;
+    address constant WETH = 0xEE8c0E9f1BFFb4Eb878d8f15f368A02a35481242;
+    address constant KURU_WETH_USDC = 0xa6aFD386135B7D41A6C40C525abC4A1019b0D132;
+    address constant CBBTC = 0xd18B7EC58Cdf4876f6AFebd3Ed1730e4Ce10414b;
+    address constant KURU_CBBTC_USDC = 0x40c49F171202F91ff5d2faE34c22dD2BFdD22aF0;
 
     PerpesEngine engine;
     address admin = makeAddr("admin");
@@ -124,5 +130,134 @@ contract MonadForkTest is Test {
         vm.warp(block.timestamp + 60);
         vm.prank(bob);
         engine.closePosition(WMON, 3_000 * USDC, 0);
+    }
+
+    function _kuruParams(address market) internal pure returns (PerpesEngine.ListingParams memory p) {
+        p.kind = PerpesEngine.SourceKind.Kuru;
+        p.v3Pool = market;
+    }
+
+    /// WETH listed off Kuru's WETH/USDC book: the router vouches for the market,
+    /// the oracle follows the book's mid, depth is the bids near it.
+    function test_listWethOnTheRealKuruBook() public {
+        if (!_fork()) return vm.skip(true);
+        vm.prank(admin);
+        engine.setKuruConfig(KURU_ROUTER, 1_000 * USDC);
+        assertEq(engine.kuruMarginAccount(), 0x2A68ba1833cDf93fa9Da1EEbd7F46242aD8E90c5);
+
+        vm.prank(alice);
+        engine.listMarket(WETH, _kuruParams(KURU_WETH_USDC));
+        PerpesEngine.Secondary memory s = engine.getSecondary(WETH);
+        assertTrue(s.listed);
+        assertEq(uint8(s.sourceKind), uint8(PerpesEngine.SourceKind.Kuru));
+        assertEq(s.v3Pool, KURU_WETH_USDC);
+        assertEq(s.kuruPricePrecision, 1e4);
+        assertEq(s.kuruSizePrecision, 1e10);
+        assertTrue(engine.lpVault(WETH) != address(0), "Kuru listings get a Counterflow vault too");
+        // A sane ETH price, straight from the book.
+        assertGt(s.oracleE6, 500 * USDC);
+        assertLt(s.oracleE6, 20_000 * USDC);
+        assertEq(s.oracleE6, s.lastSpotE6);
+        assertGe(s.spotLiquidityUsdc, 1_000 * USDC);
+        assertEq(engine.spotPriceE6(WETH), s.lastSpotE6);
+        emit log_named_decimal_uint("ETH/USD (Kuru mid)", s.oracleE6, 6);
+        emit log_named_decimal_uint("Kuru bid depth", s.spotLiquidityUsdc, 6);
+
+        vm.warp(block.timestamp + 601);
+        vm.prank(bob);
+        engine.openPosition(WETH, PerpesEngine.Side.Long, 100 * USDC, 300 * USDC, 0);
+        vm.warp(block.timestamp + 60);
+        vm.prank(bob);
+        engine.closePosition(WETH, 300 * USDC, 0);
+    }
+
+    /// An 8-decimal base: Kuru prices whole units, so decimals don't enter the price.
+    function test_listCbBtcOnTheRealKuruBook() public {
+        if (!_fork()) return vm.skip(true);
+        vm.prank(admin);
+        engine.setKuruConfig(KURU_ROUTER, 1_000 * USDC);
+        vm.prank(alice);
+        engine.listMarket(CBBTC, _kuruParams(KURU_CBBTC_USDC));
+        PerpesEngine.Secondary memory s = engine.getSecondary(CBBTC);
+        assertEq(s.baseDecimals, 8);
+        assertGt(s.oracleE6, 10_000 * USDC);
+        assertLt(s.oracleE6, 1_000_000 * USDC);
+        emit log_named_decimal_uint("BTC/USD (Kuru mid)", s.oracleE6, 6);
+    }
+
+    function test_kuruListingChecks() public {
+        if (!_fork()) return vm.skip(true);
+        // Kuru listings are off until the owner names the router.
+        vm.prank(alice);
+        vm.expectRevert(PerpesEngine.InvalidListing.selector);
+        engine.listMarket(WETH, _kuruParams(KURU_WETH_USDC));
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", alice));
+        engine.setKuruConfig(KURU_ROUTER, 0);
+        vm.prank(admin);
+        engine.setKuruConfig(KURU_ROUTER, 0);
+
+        // Not a market the Kuru router knows.
+        vm.prank(alice);
+        vm.expectRevert(PerpesEngine.InvalidListing.selector);
+        engine.listMarket(WETH, _kuruParams(makeAddr("fake book")));
+        // A real market, but for another token.
+        vm.prank(alice);
+        vm.expectRevert(PerpesEngine.InvalidListing.selector);
+        engine.listMarket(CBBTC, _kuruParams(KURU_WETH_USDC));
+        // A real market quoted in USDC, listed as if it were WMON-quoted.
+        PerpesEngine.ListingParams memory p = _kuruParams(KURU_WETH_USDC);
+        p.quoteIsWmon = true;
+        vm.prank(alice);
+        vm.expectRevert(PerpesEngine.InvalidListing.selector);
+        engine.listMarket(WETH, p);
+        // With no Kuru minimum of its own, the listing minimum ($25k) applies,
+        // and a thin book ($2.5k of bids here) can't meet it.
+        vm.mockCall(
+            KURU_WETH_USDC,
+            abi.encodeWithSignature("getL2Book(uint32,uint32)"),
+            abi.encode(abi.encodePacked(block.number, uint256(25e6), uint256(1e10), uint256(0)))
+        );
+        vm.prank(alice);
+        vm.expectRevert(PerpesEngine.InsufficientPoolDepth.selector);
+        engine.listMarket(WETH, _kuruParams(KURU_WETH_USDC));
+    }
+
+    /// A book with an empty side (or a gaping spread) is no price: the oracle
+    /// holds, nothing new opens, exits still go through.
+    function test_kuruGappedBookBlocksOpensNotCloses() public {
+        if (!_fork()) return vm.skip(true);
+        vm.prank(admin);
+        engine.setKuruConfig(KURU_ROUTER, 1_000 * USDC);
+        vm.prank(alice);
+        engine.listMarket(WETH, _kuruParams(KURU_WETH_USDC));
+        vm.warp(block.timestamp + 601);
+        vm.prank(bob);
+        engine.openPosition(WETH, PerpesEngine.Side.Long, 100 * USDC, 300 * USDC, 0);
+        uint256 oracleBefore = engine.getSecondary(WETH).oracleE6;
+
+        // Every ask taken.
+        vm.mockCall(
+            KURU_WETH_USDC, abi.encodeWithSignature("bestBidAsk()"), abi.encode(uint256(2_000e18), type(uint256).max)
+        );
+        vm.warp(block.timestamp + 30);
+        assertEq(engine.spotPriceE6(WETH), 0);
+        vm.prank(alice);
+        vm.expectRevert(PerpesEngine.InvalidPrice.selector);
+        engine.openPosition(WETH, PerpesEngine.Side.Short, 100 * USDC, 300 * USDC, 0);
+        vm.prank(bob);
+        engine.closePosition(WETH, 150 * USDC, 0);
+        assertEq(engine.getSecondary(WETH).oracleE6, oracleBefore, "oracle holds");
+
+        // A 20% spread is no price either.
+        vm.mockCall(
+            KURU_WETH_USDC, abi.encodeWithSignature("bestBidAsk()"), abi.encode(uint256(2_000e18), uint256(2_400e18))
+        );
+        assertEq(engine.spotPriceE6(WETH), 0);
+        vm.clearMockedCalls();
+        assertGt(engine.spotPriceE6(WETH), 0);
+        vm.prank(bob);
+        engine.closePosition(WETH, 150 * USDC, 0);
     }
 }

@@ -27,6 +27,45 @@ interface IUniswapV3FactoryLike {
     function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address);
 }
 
+/// Kuru (on-chain CLOB on Monad) market factory: knows every genuine market.
+interface IKuruRouterLike {
+    /// Zeros for an address that isn't a Kuru market.
+    function verifiedMarket(address market)
+        external
+        view
+        returns (
+            uint32 pricePrecision,
+            uint96 sizePrecision,
+            address baseAsset,
+            uint256 baseAssetDecimals,
+            address quoteAsset,
+            uint256 quoteAssetDecimals,
+            uint32 tickSize,
+            uint96 minSize,
+            uint96 maxSize,
+            uint256 takerFeeBps,
+            uint256 makerFeeBps
+        );
+    function marginAccountAddress() external view returns (address);
+}
+
+interface IKuruOrderBookLike {
+    /// Best bid / ask across resting orders and the market's AMM vault, quote
+    /// per whole base, 1e18 fixed.
+    function bestBidAsk() external view returns (uint256 bid, uint256 ask);
+    /// Block number, then (price, size) pairs per bid level best-first, a zero
+    /// word, then the asks. Prices in `pricePrecision`, sizes in `sizePrecision` units.
+    function getL2Book(uint32 bidPricePoints, uint32 askPricePoints) external view returns (bytes memory);
+    function getVaultParams()
+        external
+        view
+        returns (address ammVault, uint256, uint96, uint256, uint96, uint96, uint96, uint96);
+}
+
+interface IKuruMarginAccountLike {
+    function getBalance(address user, address token) external view returns (uint256);
+}
+
 /// @title PerpesOracle
 /// @notice On-chain prices for oracle-priced markets, read straight from
 /// Uniswap pools — no keeper, no outside feed.
@@ -91,6 +130,62 @@ library PerpesOracle {
         PoolId id = key.toId();
         (sqrtP,,,) = StateLibrary.getSlot0(pm, id);
         liquidity = StateLibrary.getLiquidity(pm, id);
+    }
+
+    // ── Kuru ─────────────────────────────────────────────────────────────────
+
+    /// Mid of the book (1e18 fixed), or 0 when a side is empty or the spread
+    /// is wider than `maxSpreadBps` — a gapped book is no price at all.
+    function kuruMid(address book, uint256 maxSpreadBps) internal view returns (uint256) {
+        try IKuruOrderBookLike(book).bestBidAsk() returns (uint256 bid, uint256 ask) {
+            if (bid == 0 || ask <= bid || ask == type(uint256).max) return 0;
+            if ((ask - bid) * 10_000 > bid * maxSpreadBps) return 0;
+            return (bid + ask) / 2;
+        } catch {
+            return 0;
+        }
+    }
+
+    /// Quote (raw units) resting on the best `levels` bid price points within
+    /// `bandBps` below `midE18`, plus the quote the market's AMM vault holds.
+    function kuruBidDepth(
+        address book,
+        address vault,
+        address marginAccount,
+        address quote,
+        uint256 midE18,
+        uint32 levels,
+        uint256 bandBps,
+        uint256 pricePrecision,
+        uint256 sizePrecision,
+        uint8 quoteDecimals
+    ) internal view returns (uint256 depth) {
+        if (vault != address(0) && marginAccount != address(0)) {
+            try IKuruMarginAccountLike(marginAccount).getBalance(vault, quote) returns (uint256 b) {
+                depth = b;
+            } catch {}
+        }
+        bytes memory l2;
+        try IKuruOrderBookLike(book).getL2Book(levels, 0) returns (bytes memory b) {
+            l2 = b;
+        } catch {
+            return depth;
+        }
+        // Lowest price that still counts, in the book's price units.
+        uint256 floorPrice = FullMath.mulDiv(midE18, pricePrecision * (10_000 - bandBps), 1e18 * 10_000);
+        uint256 unit = 10 ** uint256(quoteDecimals);
+        uint256 words = l2.length / 32;
+        // Word 0 is the block number; bids follow as (price, size) until a zero price.
+        for (uint256 i = 1; i + 1 < words; i += 2) {
+            uint256 price;
+            uint256 size;
+            assembly ("memory-safe") {
+                price := mload(add(l2, mul(add(i, 1), 32)))
+                size := mload(add(l2, mul(add(i, 2), 32)))
+            }
+            if (price == 0 || price < floorPrice) break;
+            depth += FullMath.mulDiv(price, size * unit, pricePrecision * sizePrecision);
+        }
     }
 
     // ── Smoothing ────────────────────────────────────────────────────────────

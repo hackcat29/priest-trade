@@ -56,11 +56,11 @@ export interface MarketSummaryView {
   raydiumPool: string | null;
   /** Monad graduation spot pool: the Uniswap v4 PoolId (null before graduation). */
   spotPoolId?: string | null;
-  spotVenue?: 'raydium' | 'uniswap-v4' | 'uniswap-v3' | null;
+  spotVenue?: 'raydium' | 'uniswap-v4' | 'uniswap-v3' | 'kuru' | null;
   /** 'listed': perps on an existing token (Monad); 'launched': created on Perpes. */
   origin?: 'launched' | 'listed';
   /** How an oracle market is priced on-chain. */
-  oracleSource?: 'uniswap-v3-twap' | 'uniswap-v4-ema' | null;
+  oracleSource?: 'uniswap-v3-twap' | 'uniswap-v4-ema' | 'kuru-ema' | null;
   /** The market's Counterflow vault holds cash: it's deeper and its winners are paid from the vault. */
   counterflowBacked?: boolean;
   /** The market's own Counterflow vault (EVM oracle markets; null elsewhere). */

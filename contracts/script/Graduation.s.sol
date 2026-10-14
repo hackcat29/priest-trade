@@ -37,6 +37,19 @@ library UniswapDeployments {
     }
 }
 
+/// Kuru (order-book DEX) per chain, in deployments/<chainId>.kuru.json: the
+/// market factory listings are verified against and the minimum book depth
+/// (USDC E6; 0 = the listing config's). No file = no Kuru listings.
+library KuruDeployments {
+    function load(VmSafe vm) internal returns (address router, uint256 minDepthUsdc) {
+        string memory path = string.concat(vm.projectRoot(), "/deployments/", vm.toString(block.chainid), ".kuru.json");
+        if (!vm.exists(path)) return (address(0), 0);
+        string memory json = vm.readFile(path);
+        router = vm.parseJsonAddress(json, ".router");
+        minDepthUsdc = vm.parseJsonUint(json, ".minDepthUsdc");
+    }
+}
+
 /// Testnet only:
 ///   forge script script/Graduation.s.sol:DeployUniswapV4 --rpc-url monad_testnet --broadcast \
 ///     --private-key $MONAD_DEPLOYER_PRIVATE_KEY --disable-code-size-limit
@@ -169,7 +182,12 @@ contract UpgradeEngine is Script {
         if (vaultImpl == address(0)) vaultImpl = address(new CounterflowVault());
         engine.upgradeToAndCall(engineImpl, abi.encodeCall(PerpesEngine.setLpConfig, (Defaults.lpConfig(beacon))));
         UpgradeableBeacon(beacon).upgradeTo(vaultImpl);
+        (address kuru, uint256 kuruMinDepth) = KuruDeployments.load(vm);
+        if (kuru != address(0) && (engine.kuruRouter() != kuru || engine.kuruMinDepthUsdc() != kuruMinDepth)) {
+            engine.setKuruConfig(kuru, kuruMinDepth);
+        }
         vm.stopBroadcast();
+        console2.log("kuru router", kuru);
         console2.log("implementation", engineImpl);
         console2.log("vault implementation", vaultImpl);
         if (!vm.isContext(VmSafe.ForgeContext.ScriptBroadcast) && !vm.isContext(VmSafe.ForgeContext.ScriptResume)) {

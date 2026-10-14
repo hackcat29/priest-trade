@@ -35,6 +35,23 @@ export const EVM_CHAINS: Record<EvmChainKey, Chain> = {
   monad: monadMainnet,
 };
 
+/** Alchemy's Monad endpoint for `chain`. */
+export function alchemyMonadRpcUrl(chain: EvmChainKey, apiKey: string): string {
+  return `https://monad-${chain === 'monad' ? 'mainnet' : 'testnet'}.g.alchemy.com/v2/${apiKey}`;
+}
+
+/**
+ * The RPC a backend service talks to: an explicit URL (EVM_RPC_URL), else
+ * Alchemy when an API key is set (ALCHEMY_API_KEY), else the public endpoint.
+ */
+export function evmRpcUrl(chain: EvmChainKey, opts: { rpcUrl?: string | undefined; alchemyApiKey?: string | undefined } = {}): string {
+  const explicit = opts.rpcUrl?.trim();
+  if (explicit) return explicit;
+  const key = opts.alchemyApiKey?.trim();
+  if (key) return alchemyMonadRpcUrl(chain, key);
+  return EVM_CHAINS[chain].rpcUrls.default.http[0]!;
+}
+
 export function isEvmChainKey(value: string | null | undefined): value is EvmChainKey {
   return value === 'monad-testnet' || value === 'monad';
 }
@@ -137,7 +154,16 @@ export const orderTypeName = (value: number): OrderTypeName =>
 export const OrderStatus = ['None', 'Open', 'PartiallyFilled', 'Filled', 'Cancelled'] as const;
 
 /** Where an oracle market's price comes from (PerpesEngine.SourceKind). */
-export const SourceKind = { V4: 0, V3: 1 } as const;
+export const SourceKind = { V4: 0, V3: 1, Kuru: 2 } as const;
+
+/** Kuru (Monad's on-chain order book), which listings may be priced from. */
+export const KURU_MAINNET_ROUTER: Address = '0xd651346d7c789536ebf06dc72ae3c8502cd695cc';
+
+/** Kuru app link for a market (order book) address. */
+export function kuruMarketUrl(chain: EvmChainKey, market: string): string | null {
+  if (chain !== 'monad' || !isEvmAddress(market)) return null;
+  return `https://www.kuru.io/markets/${market.toLowerCase()}`;
+}
 export type OrderStatusName = (typeof OrderStatus)[number];
 
 // ── Units ────────────────────────────────────────────────────────────────────

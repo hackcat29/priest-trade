@@ -27,6 +27,7 @@ import {
 } from '@perpes/offchain';
 import {
   EVM_CHAINS,
+  evmRpcUrl,
   MarketStatus,
   OrderStatus,
   fromE6,
@@ -52,7 +53,7 @@ const deployment = getEvmDeployment(CHAIN, {
 if (!deployment) throw new Error(`No PerpesEngine deployment for ${CHAIN}; set EVM_ENGINE_ADDRESS`);
 const ENGINE = deployment.engine;
 
-const RPC_URL = process.env['EVM_RPC_URL'] || EVM_CHAINS[CHAIN].rpcUrls.default.http[0]!;
+const RPC_URL = evmRpcUrl(CHAIN, { rpcUrl: process.env['EVM_RPC_URL'], alchemyApiKey: process.env['ALCHEMY_API_KEY'] });
 const PORT = Number.parseInt(process.env['EVM_INDEXER_PORT'] ?? '3021', 10);
 const POLL_MS = Number.parseInt(process.env['EVM_INDEXER_POLL_MS'] ?? '1000', 10);
 // Public Monad RPCs cap eth_getLogs ranges; 100 blocks ≈ 40s of chain time.
@@ -103,12 +104,31 @@ async function writeCursor(block: bigint): Promise<void> {
 
 // ── Log loop ───────────────────────────────────────────────────────────────────
 
+// Providers cap eth_getLogs differently (Alchemy's free tier: 10 blocks), so a
+// range the RPC rejects is halved until it's accepted, and stays that size.
+let logRange = MAX_RANGE;
+
+async function getLogsInRange(from: bigint, head: bigint): Promise<{ to: bigint; logs: Log[] }> {
+  for (;;) {
+    const to = from + logRange - 1n < head ? from + logRange - 1n : head;
+    try {
+      return { to, logs: await client.getLogs({ address: ENGINE, fromBlock: from, toBlock: to }) };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (logRange <= 1n || !/block range|range (is )?too|limited to|too many (blocks|results|logs)|query returned more than/i.test(message)) {
+        throw err;
+      }
+      logRange /= 2n;
+      logger.warn('eth_getLogs range rejected; narrowing', { range: logRange.toString() });
+    }
+  }
+}
+
 async function pollOnce(): Promise<void> {
   const head = await client.getBlockNumber();
   let from = (await readCursor()) + 1n;
   while (from <= head) {
-    const to = from + MAX_RANGE - 1n < head ? from + MAX_RANGE - 1n : head;
-    const logs = await client.getLogs({ address: ENGINE, fromBlock: from, toBlock: to });
+    const { to, logs } = await getLogsInRange(from, head);
     logs.sort((a, b) => Number(a.blockNumber! - b.blockNumber!) || (a.logIndex! - b.logIndex!));
     for (const log of logs) {
       await processLog(log);
@@ -586,13 +606,16 @@ async function onMarketListed(a: Args, txHash: string): Promise<void> {
   const mint = lc(a['token'] ?? a['market']);
   const lister = lc(a['lister']);
   const ts = iso(a['timestamp']);
-  const v3 = Number(a['kind']) === 1;
+  // SourceKind: 0 = Uniswap v4, 1 = Uniswap v3, 2 = Kuru order book.
+  const kind = Number(a['kind']);
+  const v3 = kind === 1;
+  const kuru = kind === 2;
   const read = async (fn: 'name' | 'symbol') =>
     String(await client.readContract({ address: mint as Address, abi: erc20Abi, functionName: fn }).catch(() => '')).slice(0, 64);
   const [name, symbol] = await Promise.all([read('name'), read('symbol')]);
   const oc = await client.readContract({ address: ENGINE, abi: perpesEngineAbi, functionName: 'oracleConfig' });
   const quote = Boolean(a['quoteIsWmon']) ? lc(oc.wmon) : deployment!.usdc;
-  const poolRef = v3 ? lc(a['v3Pool']) : v4PoolId(mint, quote, Number(a['v4Fee']), Number(a['v4TickSpacing']));
+  const poolRef = v3 || kuru ? lc(a['v3Pool']) : v4PoolId(mint, quote, Number(a['v4Fee']), Number(a['v4TickSpacing']));
   await execute(
     pool,
     `INSERT INTO markets (mint, market_pubkey, name, symbol, creator, status, category, execution_engine, risk_tier,
@@ -604,7 +627,7 @@ async function onMarketListed(a: Args, txHash: string): Promise<void> {
        category = 'Secondary', execution_engine = 'SecondaryAMM', origin = 'listed', spot_pool_id = EXCLUDED.spot_pool_id,
        spot_venue = EXCLUDED.spot_venue, oracle_source = EXCLUDED.oracle_source, chain = EXCLUDED.chain, updated_at = NOW()`,
     [mint, name || symbol || mint, symbol || name || mint.slice(0, 6), lister, usd(a['priceE6']), poolRef,
-     v3 ? 'uniswap-v3' : 'uniswap-v4', v3 ? 'uniswap-v3-twap' : 'uniswap-v4-ema', ts, CHAIN],
+     kuru ? 'kuru' : v3 ? 'uniswap-v3' : 'uniswap-v4', kuru ? 'kuru-ema' : v3 ? 'uniswap-v3-twap' : 'uniswap-v4-ema', ts, CHAIN],
   );
   const price = fromE6(big(a['priceE6']));
   await writeMarketPrices(mint, price, price, 0, 0, 0, 0, ts);
@@ -617,7 +640,7 @@ async function onMarketListed(a: Args, txHash: string): Promise<void> {
     [mint, big(a['timestamp']).toString(), big(a['priceE6']).toString(), ts],
   );
   await socialEvent(mint, 'launch', lister, `${symbol || mint} listed`,
-    `Perps on an existing token, priced from its Uniswap ${v3 ? 'v3' : 'v4'} pool.`, { txHash, pool: poolRef }, ts);
+    `Perps on an existing token, priced from its ${kuru ? 'Kuru order book' : `Uniswap ${v3 ? 'v3' : 'v4'} pool`}.`, { txHash, pool: poolRef }, ts);
   await publishJson(redis, redisChannels.discoveryNewLaunch, {
     mint, creator: lister, name, symbol, signature: txHash, timestamp: ts, chain: CHAIN, listed: true,
   });

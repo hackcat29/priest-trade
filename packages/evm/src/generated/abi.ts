@@ -1287,6 +1287,21 @@ export const perpesEngineAbi = [
             "name": "lpDepthUsdc",
             "type": "uint256",
             "internalType": "uint256"
+          },
+          {
+            "name": "kuruVault",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "kuruPricePrecision",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "kuruSizePrecision",
+            "type": "uint96",
+            "internalType": "uint96"
           }
         ]
       }
@@ -1907,6 +1922,45 @@ export const perpesEngineAbi = [
         "name": "",
         "type": "bool",
         "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "kuruMarginAccount",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "kuruMinDepthUsdc",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "kuruRouter",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
       }
     ],
     "stateMutability": "view"
@@ -3201,6 +3255,24 @@ export const perpesEngineAbi = [
         "name": "bps",
         "type": "uint16",
         "internalType": "uint16"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "setKuruConfig",
+    "inputs": [
+      {
+        "name": "router",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "minDepthUsdc",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "outputs": [],

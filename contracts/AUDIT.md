@@ -228,3 +228,26 @@ Replaces full-liability payouts on oracle markets. **Rule:** a winner gets their
 ### Primary markets (2026-10-13, later)
 The same pro-rata rule now applies on the curve, replacing the headroom-capped IOU. The pool is free funds (signed — negative once winners were paid from losers' collateral) plus the losers' loss, both measured as each side would realize **unwinding through the curve** (`_openPnl`), capped by the collateral pool. Valuing claims at the mark would haircut primary winners for nothing: the mark is the marginal price, so in a one-sided pump every long looks like a winner at it. Since the curve is zero-sum across a full unwind, the ratio stays 100% unless a loss ran past collateral (bad debt) — then the winner is paid pro rata and the rest is forfeited. IOUs remain only for cash the market can't pay (none expected) and blacklisted recipients. Tests: a winner paid in full against later buyers; a 40x long liquidated past her collateral leaves the short paid pro rata, nothing owed.
 
+
+# Kuru order-book listings (internal) — 2026-10-14
+
+**Scope:** `SourceKind.Kuru` in `listMarket`, `_readSource`, `_sampleOracle` / `_prepSecondary`, `setKuruConfig`; `PerpesOracle.kuruMid` / `kuruBidDepth`; `UpgradeEngine` (refresh path sets the Kuru config from `deployments/<chainId>.kuru.json`).
+**Method:** manual review; fork tests on Monad mainnet against Kuru's real WETH/USDC and cbBTC/USDC books (listing, open/close, every rejection, a gapped book); the full suite (108 tests). Storage: `Secondary` gains three appended fields; `kuruRouter`, `kuruMarginAccount`, `kuruMinDepthUsdc` appended after `lpVault`. `SourceKind` gains a third value (existing markets keep 0/1).
+**Same caveat:** internal review only.
+
+## Design
+- **Which markets.** A listing names a Kuru market; the configured Kuru router's `verifiedMarket` must return it with the listed token as base and USDC (or WMON, priced through the MON/USD v3 TWAP like other WMON listings) as quote. Anything the router doesn't know reads as zeros and is rejected; the market's own getters are only trusted after that.
+- **Price.** The mid of `bestBidAsk()` (resting orders and the market's AMM vault), as a 1e18 whole-unit price, fed through the same clamped EMA as v4 pools (τ 300 s, 30 s gap cap, ±50% clamp) and the same worst-of fills and velocity breaker.
+- **No price.** A side empty, or a spread over 10% of the bid, is no price. The oracle then holds: opens (and limit fills) revert, exits, liquidations and claims go through at the held oracle with worst-of against the last live mid. Uniswap sources still revert as before.
+- **Depth.** Bids on the best 10 price points within 10% below the mid, plus the quote the AMM vault holds in Kuru's margin account; smoothed upward like pool depth. It's read on every sample (~0.6M gas), so a trade's gas estimate holds. Listings need `kuruMinDepthUsdc`, or the listing minimum ($25k) when that's 0.
+
+## Findings
+
+| ID | Severity | Title | Status |
+|----|----------|-------|--------|
+| K-1 | Medium | Thin books are cheap to move | Mitigated by the depth minimum, depth-scaled OI caps and the EMA; keep `kuruMinDepthUsdc` at the listing minimum unless the book is arbitraged against deeper venues |
+| K-2 | Low | A quote inside the spread moves the mid at no cost until filled | Bounded: the EMA clamp and τ make a one-sample move ≤ ~4.5%; worst-of fills mean the mover can't trade at it |
+| K-3 | Low | Held oracle during a gapped book | Accepted: exits must not depend on a market maker returning; opens are blocked meanwhile |
+| K-4 | Info | Kuru's margin account is read from the router at `setKuruConfig` time | Re-run `setKuruConfig` if Kuru ever moves it |
+
+On 2026-10-14 Kuru's live books held $1k–$13k of bids within 10% of the mid (WETH, MON, cbBTC, XAUt0), so none met the $25k listing minimum.

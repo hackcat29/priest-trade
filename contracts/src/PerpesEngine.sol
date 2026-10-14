@@ -19,7 +19,9 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 import {PerpesMath} from "./PerpesMath.sol";
-import {IUniswapV3FactoryLike, IUniswapV3PoolLike, PerpesOracle} from "./PerpesOracle.sol";
+import {
+    IKuruOrderBookLike, IKuruRouterLike, IUniswapV3FactoryLike, IUniswapV3PoolLike, PerpesOracle
+} from "./PerpesOracle.sol";
 import {PerpesSecondaryMath} from "./PerpesSecondaryMath.sol";
 import {PerpesToken} from "./PerpesToken.sol";
 import {PerpesUniswap} from "./PerpesUniswap.sol";
@@ -359,6 +361,12 @@ contract PerpesEngine is
         // ── v4 (appended) ──
         // OI cap and skew scale the market's vault adds on top of pool depth.
         uint256 lpDepthUsdc;
+        // ── Kuru (appended) ──
+        // A Kuru market's AMM vault and its price / size units (from the Kuru
+        // router). The market itself is kept in `v3Pool`.
+        address kuruVault;
+        uint32 kuruPricePrecision;
+        uint96 kuruSizePrecision;
     }
 
     /// Where an oracle market's price comes from.
@@ -366,7 +374,9 @@ contract PerpesEngine is
         // Uniswap v4 pool (engine-kept EMA)
         V4,
         // Uniswap v3 pool (the pool's own TWAP)
-        V3
+        V3,
+        // Kuru order book (engine-kept EMA of the book mid)
+        Kuru
     }
 
     /// On-chain oracle settings (v3 layout).
@@ -418,6 +428,7 @@ contract PerpesEngine is
 
     struct ListingParams {
         SourceKind kind;
+        // The v3 pool, or the Kuru market.
         address v3Pool;
         uint24 v4Fee;
         int24 v4TickSpacing;
@@ -458,6 +469,12 @@ contract PerpesEngine is
     /// and `graduate` swaps it into line first.
     uint256 internal constant POOL_PRICE_TOLERANCE_BPS = 50;
 
+    /// A Kuru book wider than this (bps of the bid) gives no price.
+    uint256 internal constant KURU_MAX_SPREAD_BPS = 1_000;
+    /// Kuru depth: the best this many bid price points, within this band below the mid.
+    uint32 internal constant KURU_DEPTH_LEVELS = 10;
+    uint256 internal constant KURU_DEPTH_BAND_BPS = 1_000;
+
     // ── Storage ────────────────────────────────────────────────────────────────
 
     IERC20 public usdc;
@@ -490,6 +507,12 @@ contract PerpesEngine is
     /// Per-market Counterflow vaults (appended in the v4 layout).
     LpConfig internal _lpConfig;
     mapping(address token => address) public lpVault;
+    /// Kuru market factory listings may come from (0 = no Kuru listings), and
+    /// its margin account, where each market's AMM vault keeps its funds.
+    address public kuruRouter;
+    address public kuruMarginAccount;
+    /// Minimum Kuru book depth for a listing (0 = the listing config's minimum).
+    uint256 public kuruMinDepthUsdc;
 
     // ── Events ─────────────────────────────────────────────────────────────────
 
@@ -839,6 +862,22 @@ contract PerpesEngine is
 
     function setLpConfig(LpConfig calldata c) external onlyOwner {
         _setLpConfig(c);
+    }
+
+    /// Enables (or, with 0, stops new) listings priced from Kuru order books,
+    /// with their own depth minimum (0 = the listing config's). Markets already
+    /// listed keep reading the last margin account set.
+    function setKuruConfig(address router, uint256 minDepthUsdc) external onlyOwner {
+        address marginAccount;
+        if (router != address(0)) {
+            if (router.code.length == 0) revert InvalidConfig();
+            marginAccount = IKuruRouterLike(router).marginAccountAddress();
+            if (marginAccount == address(0)) revert InvalidConfig();
+        }
+        kuruRouter = router;
+        kuruMinDepthUsdc = minDepthUsdc;
+        if (marginAccount != address(0)) kuruMarginAccount = marginAccount;
+        emit OracleConfigUpdated(msg.sender, block.timestamp);
     }
 
     function _setOracleConfig(OracleConfig calldata o) internal {
@@ -1880,8 +1919,9 @@ contract PerpesEngine is
     // ── Listing ────────────────────────────────────────────────────────────────
 
     /// Permissionless: opens an oracle-priced market on an existing token that
-    /// has a Uniswap v3 (from the configured factory) or hookless v4 pool
-    /// against USDC or WMON, at least `minDepthUsdc` deep. The market trades on
+    /// has a Uniswap v3 (from the configured factory) or hookless v4 pool, or a
+    /// Kuru order book (verified by the Kuru router), against USDC or WMON, at
+    /// least `minDepthUsdc` deep. The market trades on
     /// the secondary engine; new positions wait out a short warmup while the
     /// oracle settles. The lister earns the creator share of its fees. It gets
     /// its own Counterflow vault, which anyone may back.
@@ -1909,13 +1949,27 @@ contract PerpesEngine is
             uint24 fee = IUniswapV3PoolLike(p.v3Pool).fee();
             if (IUniswapV3FactoryLike(factory).getPool(token, quote, fee) != p.v3Pool) revert InvalidListing();
             s.v3Pool = p.v3Pool;
+        } else if (p.kind == SourceKind.Kuru) {
+            address router = kuruRouter;
+            if (router == address(0) || p.v3Pool == address(0)) revert InvalidListing();
+            (uint32 pricePrecision, uint96 sizePrecision, address base,, address kuruQuote,,,,,,) =
+                IKuruRouterLike(router).verifiedMarket(p.v3Pool);
+            if (pricePrecision == 0 || sizePrecision == 0 || base != token || kuruQuote != quote) {
+                revert InvalidListing();
+            }
+            (address ammVault,,,,,,,) = IKuruOrderBookLike(p.v3Pool).getVaultParams();
+            s.v3Pool = p.v3Pool;
+            s.kuruVault = ammVault;
+            s.kuruPricePrecision = pricePrecision;
+            s.kuruSizePrecision = sizePrecision;
         } else {
             if (uniswap.poolManager == address(0)) revert UniswapNotConfigured();
             s.v4Fee = p.v4Fee;
             s.v4TickSpacing = p.v4TickSpacing;
         }
         (uint256 spot, uint256 twap, uint256 depth) = _readSource(token, s);
-        if (spot == 0 || depth < lc.minDepthUsdc) revert InsufficientPoolDepth();
+        uint256 minDepth = p.kind == SourceKind.Kuru && kuruMinDepthUsdc != 0 ? kuruMinDepthUsdc : lc.minDepthUsdc;
+        if (spot == 0 || depth < minDepth) revert InsufficientPoolDepth();
         // A v3 pool must already serve a TWAP over the window (enough history).
         if (p.kind == SourceKind.V3 && twap == 0) revert InvalidListing();
         _initListedMarket(token, s, p.kind == SourceKind.V3 ? twap : spot, spot, depth, lc);
@@ -1988,9 +2042,10 @@ contract PerpesEngine is
 
     // ── On-chain oracle ────────────────────────────────────────────────────────
 
-    /// The market's pool: live price and its own TWAP (v3; 0 for v4), both
-    /// USDC E6, and the USDC value of the pool's quote side. Before a market
-    /// graduates this reads its would-be graduation pool.
+    /// The market's pool or book: live price and its own TWAP (v3; 0 for v4
+    /// and Kuru), both USDC E6, and the USDC value of the quote side. Before a
+    /// market graduates this reads its would-be graduation pool. A Kuru book
+    /// with an empty side or a gaping spread reads as all zeros.
     function _readSource(address token, Secondary storage s)
         internal
         view
@@ -2001,25 +2056,43 @@ contract PerpesEngine is
         address quote = wmonQuote ? oc.wmon : address(usdc);
         uint8 baseDec = s.baseDecimals == 0 ? 18 : s.baseDecimals;
         uint8 quoteDec = wmonQuote ? 18 : 6;
-        bool baseIs0 = token < quote;
-        uint160 sqrtP;
-        uint128 liquidity;
-        if (s.sourceKind == SourceKind.V3) {
-            (sqrtP, liquidity) = PerpesOracle.v3Spot(s.v3Pool);
-            twapE6 = _v3TwapE18(s.v3Pool, baseIs0, baseDec, quoteDec);
+        if (s.sourceKind == SourceKind.Kuru) {
+            // Kuru quotes whole-unit prices, 1e18 fixed, like `priceE18`.
+            spotE6 = PerpesOracle.kuruMid(s.v3Pool, KURU_MAX_SPREAD_BPS);
+            if (spotE6 == 0) return (0, 0, 0);
+            depthUsdc = PerpesOracle.kuruBidDepth(
+                s.v3Pool,
+                s.kuruVault,
+                kuruMarginAccount,
+                quote,
+                spotE6,
+                KURU_DEPTH_LEVELS,
+                KURU_DEPTH_BAND_BPS,
+                s.kuruPricePrecision,
+                s.kuruSizePrecision,
+                quoteDec
+            );
         } else {
-            if (uniswap.poolManager == address(0)) revert UniswapNotConfigured();
-            PoolKey memory key = s.listed
-                ? PerpesUniswap.poolKey(token, quote, s.v4Fee, s.v4TickSpacing)
-                : graduationPoolKey(token);
-            (sqrtP, liquidity) = PerpesOracle.v4Spot(IPoolManager(uniswap.poolManager), key);
+            bool baseIs0 = token < quote;
+            uint160 sqrtP;
+            uint128 liquidity;
+            if (s.sourceKind == SourceKind.V3) {
+                (sqrtP, liquidity) = PerpesOracle.v3Spot(s.v3Pool);
+                twapE6 = _v3TwapE18(s.v3Pool, baseIs0, baseDec, quoteDec);
+            } else {
+                if (uniswap.poolManager == address(0)) revert UniswapNotConfigured();
+                PoolKey memory key = s.listed
+                    ? PerpesUniswap.poolKey(token, quote, s.v4Fee, s.v4TickSpacing)
+                    : graduationPoolKey(token);
+                (sqrtP, liquidity) = PerpesOracle.v4Spot(IPoolManager(uniswap.poolManager), key);
+            }
+            if (sqrtP == 0) return (0, 0, 0);
+            spotE6 = PerpesOracle.priceE18(sqrtP, baseIs0, baseDec, quoteDec);
+            depthUsdc = PerpesOracle.quoteDepth(liquidity, sqrtP, !baseIs0);
+            // Concentrated v3 liquidity makes in-range "virtual" depth overstate
+            // what the pool holds; never count more than its actual quote balance.
+            if (s.sourceKind == SourceKind.V3) depthUsdc = _min(depthUsdc, IERC20(quote).balanceOf(s.v3Pool));
         }
-        if (sqrtP == 0) return (0, 0, 0);
-        spotE6 = PerpesOracle.priceE18(sqrtP, baseIs0, baseDec, quoteDec);
-        depthUsdc = PerpesOracle.quoteDepth(liquidity, sqrtP, !baseIs0);
-        // Concentrated v3 liquidity makes in-range "virtual" depth overstate
-        // what the pool holds; never count more than its actual quote balance.
-        if (s.sourceKind == SourceKind.V3) depthUsdc = _min(depthUsdc, IERC20(quote).balanceOf(s.v3Pool));
         if (wmonQuote) {
             // MON → USD from the reference pool's TWAP (its spot only if the
             // pool can't serve the window).
@@ -2054,11 +2127,17 @@ contract PerpesEngine is
 
     /// Reads the pool and updates the market's oracle: always the live price
     /// (for worst-of fills and the breaker); at most once per second the
-    /// average — the v3 TWAP, or one clamped EMA step for v4 — and the depth,
-    /// whose increases are smoothed so JIT liquidity can't inflate caps.
-    function _sampleOracle(address token, Secondary storage s) internal {
+    /// average — the v3 TWAP, or one clamped EMA step for v4 and Kuru — and the
+    /// depth, whose increases are smoothed so JIT liquidity can't inflate caps.
+    /// False when a Kuru book gives no price right now (a side emptied, or the
+    /// spread blew out): the oracle holds, so exits still work, but nothing opens.
+    function _sampleOracle(address token, Secondary storage s) internal returns (bool fresh) {
         (uint256 spot, uint256 twap, uint256 depth) = _readSource(token, s);
-        if (spot == 0) revert InvalidPrice();
+        if (spot == 0) {
+            if (s.sourceKind == SourceKind.Kuru) return false;
+            revert InvalidPrice();
+        }
+        fresh = true;
         s.lastSpotE6 = spot;
         uint256 nowTs = block.timestamp;
         uint256 dt = nowTs - s.lastOracleTs;
@@ -2440,7 +2519,7 @@ contract PerpesEngine is
             if (s.closeOnly) revert InvalidMarketStatus();
             if (s.listed && block.timestamp < m.warmupUntil) revert MarketWarmingUp();
         }
-        _sampleOracle(token, s);
+        if (!_sampleOracle(token, s) && opening) revert InvalidPrice();
         m.indexPriceE6 = s.oracleE6;
         _refreshSecondary(m, s);
     }
