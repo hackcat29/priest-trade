@@ -156,12 +156,13 @@ Priest.trade includes a full-featured cross-platform mobile application engineer
 | Contract | Address | Explorer Link |
 |---|---|---|
 | **PerpesEngine (Proxy)** | `0xdCb4FbCdebBeB3C3D1233EDDBFE21e086acE923d` | [MonadVision](https://monadvision.com/address/0xdCb4FbCdebBeB3C3D1233EDDBFE21e086acE923d) |
-| **PerpesEngine (Implementation)** | `0x6CF8964546FB6292081Ab6AE4DCAc39871A6BB63` | [MonadVision](https://monadvision.com/address/0x6CF8964546FB6292081Ab6AE4DCAc39871A6BB63) |
-| **CounterflowVault (`cfUSDC`)** | `0x7AA4Bc202A7FB54766b83D8a01046248D1b250F1` | [MonadVision](https://monadvision.com/address/0x7AA4Bc202A7FB54766b83D8a01046248D1b250F1) |
+| **PerpesEngine (Implementation)** | `0xa48C467ee48E6702b1604d118C70a31FE4d76edd` | [MonadVision](https://monadvision.com/address/0xa48C467ee48E6702b1604d118C70a31FE4d76edd) |
+| **Counterflow vault beacon** (one `cfUSDC` vault per market, `engine.lpVault(token)`) | `0x7f77F0F174Fe83A18CC3e00780e4430CdD07CD31` | [MonadVision](https://monadvision.com/address/0x7f77F0F174Fe83A18CC3e00780e4430CdD07CD31) |
 | **Native Circle USDC** | `0x754704Bc059F8C67012fEd69BC8A327a5aafb603` | [MonadVision](https://monadvision.com/address/0x754704Bc059F8C67012fEd69BC8A327a5aafb603) |
 | **Uniswap v4 PoolManager** | `0x188d586Ddcf52439676Ca21A244753fA19F9Ea8e` | [MonadVision](https://monadvision.com/address/0x188d586Ddcf52439676Ca21A244753fA19F9Ea8e) |
 | **Uniswap v4 PositionManager** | `0x5b7eC4a94fF9beDb700fb82aB09d5846972F4016` | [MonadVision](https://monadvision.com/address/0x5b7eC4a94fF9beDb700fb82aB09d5846972F4016) |
 | **Uniswap v3 Factory** | `0x204FAca1764B154221e35c0d20aBb3c525710498` | [MonadVision](https://monadvision.com/address/0x204FAca1764B154221e35c0d20aBb3c525710498) |
+| **Kuru Router** (listings verified against it) | `0xd651346d7c789536ebf06dc72aE3C8502cd695CC` | [MonadVision](https://monadvision.com/address/0xd651346d7c789536ebf06dc72aE3C8502cd695CC) |
 | **Burn Address** | `0x000000000000000000000000000000000000dEaD` | Permanent LP & Token Burn |
 
 ### Monad Testnet (Chain ID: `10143`)
@@ -169,7 +170,8 @@ Priest.trade includes a full-featured cross-platform mobile application engineer
 | Contract | Address | Explorer Link |
 |---|---|---|
 | **PerpesEngine (Proxy)** | `0x041f3b8A1874E8ceBa41C29782Baba20B38F9c35` | [Testnet Explorer](https://testnet.monadexplorer.com/address/0x041f3b8A1874E8ceBa41C29782Baba20B38F9c35) |
-| **CounterflowVault (`cfUSDC`)** | `0x0cDa05B16734793AeF452C983bE5773c720Da471` | [Testnet Explorer](https://testnet.monadexplorer.com/address/0x0cDa05B16734793AeF452C983bE5773c720Da471) |
+| **PerpesEngine (Implementation)** | `0x60dc8F87BE2B06cee99AF2BA4fC1D47B58776b2c` | [Testnet Explorer](https://testnet.monadexplorer.com/address/0x60dc8F87BE2B06cee99AF2BA4fC1D47B58776b2c) |
+| **Counterflow vault beacon** | `0xaaaDa0912E5A21C47c318AdC22BA5687482c2466` | [Testnet Explorer](https://testnet.monadexplorer.com/address/0xaaaDa0912E5A21C47c318AdC22BA5687482c2466) |
 | **MockUSDC (Faucet)** | `0x534EEE2DC77854015A398B9DD6872eF1498B6764` | Public faucet for testnet trading |
 
 ---
