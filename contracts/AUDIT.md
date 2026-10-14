@@ -245,9 +245,9 @@ The same pro-rata rule now applies on the curve, replacing the headroom-capped I
 
 | ID | Severity | Title | Status |
 |----|----------|-------|--------|
-| K-1 | Medium | Thin books are cheap to move | Mitigated by the depth minimum, depth-scaled OI caps and the EMA; keep `kuruMinDepthUsdc` at the listing minimum unless the book is arbitraged against deeper venues |
+| K-1 | Medium | Thin books are cheap to move | Mitigated by depth-scaled OI caps (1× book depth unbacked) and the EMA. Mainnet uses `kuruMinDepthUsdc` = $2.5k, so open interest on such a market stays around its book's depth |
 | K-2 | Low | A quote inside the spread moves the mid at no cost until filled | Bounded: the EMA clamp and τ make a one-sample move ≤ ~4.5%; worst-of fills mean the mover can't trade at it |
 | K-3 | Low | Held oracle during a gapped book | Accepted: exits must not depend on a market maker returning; opens are blocked meanwhile |
 | K-4 | Info | Kuru's margin account is read from the router at `setKuruConfig` time | Re-run `setKuruConfig` if Kuru ever moves it |
 
-On 2026-10-14 Kuru's live books held $1k–$13k of bids within 10% of the mid (WETH, MON, cbBTC, XAUt0), so none met the $25k listing minimum.
+On 2026-10-14 Kuru's live books held $1k–$13k of bids within 10% of the mid (WETH, MON, cbBTC, XAUt0), so none met the $25k listing minimum. Mainnet's Kuru minimum is set to $2.5k, which WETH and cbBTC meet.

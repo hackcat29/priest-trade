@@ -21,7 +21,7 @@ Traditional perpetual DEXes only support a curated allowlist of high-market-cap 
 ### 1. Permissionless Token Listing (Any Monad Token)
 Calling `listMarket(token, params)` opens a live perpetual futures market for any existing Monad token in a single on-chain transaction:
 - **Zero Gatekeeping:** No team approval, no governance delays, and zero listing fee by default.
-- **Real Spot Liquidity Grounding:** Requires an existing Uniswap **v3** (from the configured factory) or hookless **v4** pool, or a **Kuru** order book (verified by Kuru's router), against USDC or WMON with at least **$25k** depth.
+- **Real Spot Liquidity Grounding:** Requires an existing Uniswap **v3** (from the configured factory) or hookless **v4** pool, or a **Kuru** order book (verified by Kuru's router), against USDC or WMON with at least **$25k** of depth (**$2.5k** for a Kuru book).
 - **Oracle Worst-Of Fill Protection:** Trades execute at the worse of the on-chain oracle and pool price ($\max$ for buys, $\min$ for sells), mathematically preventing oracle manipulation and MEV front-running.
 - **Lister Incentives:** The wallet that lists the token earns the creator share of trading fees.
 - **Isolated Counterflow LP Vault:** Each listed market spawns its own ERC-4626 vault (`cfUSDC`) that anyone can fund to act as counterparty and earn yield.
@@ -63,12 +63,15 @@ Priest.trade is engineered from the ground up for Monad's architecture:
 Listings can be priced from a **Kuru** order book as well as a Uniswap pool (`SourceKind.Kuru` in `listMarket`):
 - **Only genuine markets.** Kuru's router (`verifiedMarket`) must confirm the market, with the listed token as base and USDC or WMON as quote. Anything it doesn't know is rejected.
 - **Price.** The mid of `bestBidAsk()` (resting orders plus Kuru's AMM vault), smoothed by the same clamped on-chain EMA as v4 pools, with worst-of fills and the velocity breaker.
-- **Depth.** Bids on the best 10 price points within 10% of the mid, plus the AMM vault's quote reserve. This sets OI caps and the skew scale, and must reach the listing minimum (`kuruMinDepthUsdc`, or $25k by default).
+- **Depth.** Bids on the best 10 price points within 10% of the mid, plus the AMM vault's quote reserve. This sets OI caps and the skew scale, and must reach `kuruMinDepthUsdc`: $2.5k on mainnet (`contracts/deployments/143.kuru.json`), which Kuru's WETH and cbBTC books meet today. Because OI caps scale with this depth, a thin book only supports a small market.
 - **Gapped books.** If a side of the book empties, or the spread passes 10%, the oracle holds. New positions are blocked; exits and liquidations keep working.
 - Code: `contracts/src/PerpesOracle.sol` (`kuruMid`, `kuruBidDepth`), `contracts/src/PerpesEngine.sol` (`listMarket`, `_readSource`, `setKuruConfig`). Fork tests in `contracts/test/MonadFork.t.sol` list WETH and cbBTC off Kuru's live mainnet books. Review notes are in `contracts/AUDIT.md` (K-1…K-4).
 
 ### Alchemy: Monad RPC for the backend
 The indexer and keeper use **Alchemy's** Monad endpoint when `ALCHEMY_API_KEY` is set, with `EVM_RPC_URL` taking precedence and the public RPC as the fallback (`evmRpcUrl` in `packages/evm`). The indexer halves its `eth_getLogs` block range whenever a provider rejects it, so it runs on any Alchemy plan.
+
+### Aurora Intents: deposit from any chain
+On priest.trade, traders can fund their Monad wallet from Bitcoin, Solana, Tron, TON or any EVM chain. They send to a one-off **Aurora Intents** deposit address and receive USDC on Monad, without bridging or connecting a source-chain wallet. Unfilled deposits are refunded on the source chain. The client and deposit sheet are in [`web/aurora-intents/`](web/aurora-intents/), an excerpt from the web app.
 
 ## 📐 Architecture
 

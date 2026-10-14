@@ -2,5 +2,5 @@
   "chainId": 143,
   "router": "0xd651346d7c789536ebf06dc72aE3C8502cd695CC",
   "marginAccount": "0x2A68ba1833cDf93fa9Da1EEbd7F46242aD8E90c5",
-  "minDepthUsdc": 0
+  "minDepthUsdc": 2500000000
 }
