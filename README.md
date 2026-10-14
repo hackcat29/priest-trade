@@ -67,8 +67,8 @@ Listings can be priced from a **Kuru** order book as well as a Uniswap pool (`So
 - **Gapped books.** If a side of the book empties, or the spread passes 10%, the oracle holds. New positions are blocked; exits and liquidations keep working.
 - Code: `contracts/src/PerpesOracle.sol` (`kuruMid`, `kuruBidDepth`), `contracts/src/PerpesEngine.sol` (`listMarket`, `_readSource`, `setKuruConfig`). Fork tests in `contracts/test/MonadFork.t.sol` list WETH and cbBTC off Kuru's live mainnet books. Review notes are in `contracts/AUDIT.md` (K-1…K-4).
 
-### Alchemy: Monad RPC for the backend
-The indexer and keeper use **Alchemy's** Monad endpoint when `ALCHEMY_API_KEY` is set, with `EVM_RPC_URL` taking precedence and the public RPC as the fallback (`evmRpcUrl` in `packages/evm`). The indexer halves its `eth_getLogs` block range whenever a provider rejects it, so it runs on any Alchemy plan.
+### Alchemy: Monad RPC fallback for the backend
+The indexer and keeper read Monad through viem's `fallback` transport (`evmRpcUrls` in `packages/evm`). They use `EVM_RPC_URL` or the public endpoint first, then **Alchemy's** Monad endpoint when `ALCHEMY_API_KEY` is set, so an outage or rate limit on one provider doesn't stall indexing. The indexer also halves its `eth_getLogs` block range whenever a provider rejects it.
 
 ### Aurora Intents: deposit from any chain
 On priest.trade, traders can fund their Monad wallet from Bitcoin, Solana, Tron, TON or any EVM chain. They send to a one-off **Aurora Intents** deposit address and receive USDC on Monad, without bridging or connecting a source-chain wallet. Unfilled deposits are refunded on the source chain. The client and deposit sheet are in [`web/aurora-intents/`](web/aurora-intents/), an excerpt from the web app.

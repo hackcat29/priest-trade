@@ -20,6 +20,7 @@ import {
   ContractFunctionRevertedError,
   createPublicClient,
   createWalletClient,
+  fallback,
   http,
   zeroAddress,
   type Address,
@@ -30,7 +31,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createHealthServer, createLogger, createPgPool, queryRows, requireEnv } from '@perpes/offchain';
 import {
   EVM_CHAINS,
-  evmRpcUrl,
+  evmRpcUrls,
   getEvmDeployment,
   isEvmChainKey,
   mockUsdcAbi,
@@ -52,7 +53,8 @@ const deployment = getEvmDeployment(CHAIN, {
 if (!deployment) throw new Error(`No PerpesEngine deployment for ${CHAIN}; set EVM_ENGINE_ADDRESS`);
 const ENGINE = deployment.engine;
 
-const RPC_URL = evmRpcUrl(CHAIN, { rpcUrl: process.env['EVM_RPC_URL'], alchemyApiKey: process.env['ALCHEMY_API_KEY'] });
+// The public (or EVM_RPC_URL) endpoint first, Alchemy only if it fails.
+const RPC_URLS = evmRpcUrls(CHAIN, { rpcUrl: process.env['EVM_RPC_URL'], alchemyApiKey: process.env['ALCHEMY_API_KEY'] });
 const PORT = Number.parseInt(process.env['EVM_KEEPER_PORT'] ?? '3022', 10);
 const TICK_MS = Number.parseInt(process.env['EVM_KEEPER_TICK_MS'] ?? '2000', 10);
 const DRY_RUN = process.env['KEEPER_DRY_RUN'] === 'true';
@@ -81,7 +83,7 @@ function loadKey(): Hex {
 
 const account = privateKeyToAccount(loadKey());
 const chain = EVM_CHAINS[CHAIN];
-const transport = http(RPC_URL, { retryCount: 3, timeout: 20_000 });
+const transport = fallback(RPC_URLS.map((url) => http(url, { retryCount: 2, timeout: 20_000 })));
 const publicClient = createPublicClient({ chain, transport });
 const walletClient = createWalletClient({ chain, transport, account });
 const pool = createPgPool(requireEnv('DATABASE_URL'), SERVICE_NAME);

@@ -11,7 +11,7 @@
  *   - Addresses are lowercased; markets.chain / launches.chain carry the chain key.
  *   - Every log is idempotent via processed_transactions ("<chain>:<tx>:<logIndex>").
  */
-import { createPublicClient, decodeEventLog, encodeAbiParameters, erc20Abi, http, keccak256, type Address, type Log } from 'viem';
+import { createPublicClient, decodeEventLog, encodeAbiParameters, erc20Abi, fallback, http, keccak256, type Address, type Log } from 'viem';
 
 import {
   createHealthServer,
@@ -27,7 +27,8 @@ import {
 } from '@perpes/offchain';
 import {
   EVM_CHAINS,
-  evmRpcUrl,
+  evmRpcUrls,
+  redactRpcUrl,
   MarketStatus,
   OrderStatus,
   fromE6,
@@ -53,7 +54,8 @@ const deployment = getEvmDeployment(CHAIN, {
 if (!deployment) throw new Error(`No PerpesEngine deployment for ${CHAIN}; set EVM_ENGINE_ADDRESS`);
 const ENGINE = deployment.engine;
 
-const RPC_URL = evmRpcUrl(CHAIN, { rpcUrl: process.env['EVM_RPC_URL'], alchemyApiKey: process.env['ALCHEMY_API_KEY'] });
+// The public (or EVM_RPC_URL) endpoint first, Alchemy only if it fails.
+const RPC_URLS = evmRpcUrls(CHAIN, { rpcUrl: process.env['EVM_RPC_URL'], alchemyApiKey: process.env['ALCHEMY_API_KEY'] });
 const PORT = Number.parseInt(process.env['EVM_INDEXER_PORT'] ?? '3021', 10);
 const POLL_MS = Number.parseInt(process.env['EVM_INDEXER_POLL_MS'] ?? '1000', 10);
 // Public Monad RPCs cap eth_getLogs ranges; 100 blocks ≈ 40s of chain time.
@@ -64,7 +66,10 @@ const REDIS_URL = requireEnv('REDIS_URL');
 const CURSOR_KEY = `evm-indexer:${CHAIN}:${ENGINE}`;
 const LAUNCH_BONUS_POINTS = 500;
 
-const client = createPublicClient({ chain: EVM_CHAINS[CHAIN], transport: http(RPC_URL, { retryCount: 3, timeout: 20_000 }) });
+const client = createPublicClient({
+  chain: EVM_CHAINS[CHAIN],
+  transport: fallback(RPC_URLS.map((url) => http(url, { retryCount: 2, timeout: 20_000 }))),
+});
 const pool = createPgPool(DATABASE_URL, SERVICE_NAME);
 const redis = createRedisClient(REDIS_URL, `${SERVICE_NAME}:redis`);
 
@@ -1122,7 +1127,7 @@ async function main(): Promise<void> {
         `perpes_evm_indexer_events_failed_total{chain="${CHAIN}"} ${eventsFailed}`,
       ].join('\n'),
   });
-  logger.info('EVM indexer starting', { chain: CHAIN, engine: ENGINE, rpc: RPC_URL.replace(/\/[^/]*$/, '/…') });
+  logger.info('EVM indexer starting', { chain: CHAIN, engine: ENGINE, rpcs: RPC_URLS.map(redactRpcUrl) });
   setInterval(() => {
     void syncAllMarkets().catch((err) => logger.warn('market sync pass failed', { err: String(err) }));
   }, SYNC_MS);

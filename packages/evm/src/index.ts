@@ -41,15 +41,20 @@ export function alchemyMonadRpcUrl(chain: EvmChainKey, apiKey: string): string {
 }
 
 /**
- * The RPC a backend service talks to: an explicit URL (EVM_RPC_URL), else
- * Alchemy when an API key is set (ALCHEMY_API_KEY), else the public endpoint.
+ * The RPCs a backend service talks to, in order: an explicit URL (EVM_RPC_URL)
+ * or else the public endpoint, then Alchemy as a fallback when an API key is
+ * set (ALCHEMY_API_KEY). Use with viem's `fallback` transport.
  */
-export function evmRpcUrl(chain: EvmChainKey, opts: { rpcUrl?: string | undefined; alchemyApiKey?: string | undefined } = {}): string {
-  const explicit = opts.rpcUrl?.trim();
-  if (explicit) return explicit;
+export function evmRpcUrls(chain: EvmChainKey, opts: { rpcUrl?: string | undefined; alchemyApiKey?: string | undefined } = {}): string[] {
+  const primary = opts.rpcUrl?.trim() || EVM_CHAINS[chain].rpcUrls.default.http[0]!;
   const key = opts.alchemyApiKey?.trim();
-  if (key) return alchemyMonadRpcUrl(chain, key);
-  return EVM_CHAINS[chain].rpcUrls.default.http[0]!;
+  const alchemy = key ? alchemyMonadRpcUrl(chain, key) : null;
+  return alchemy && alchemy !== primary ? [primary, alchemy] : [primary];
+}
+
+/** An RPC URL with any trailing API key masked, for logs. */
+export function redactRpcUrl(url: string): string {
+  return url.replace(/\/v2\/[^/]+$/, '/v2/***');
 }
 
 export function isEvmChainKey(value: string | null | undefined): value is EvmChainKey {
